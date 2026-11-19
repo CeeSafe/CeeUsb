@@ -1,0 +1,133 @@
+// The transfer ring: one per open endpoint, the replacement for the C# TransferQueue.
+//
+// The C# version paid, per transfer: a TransferEntry, a platform context object, a GCHandle, a native URB
+// allocation (Linux), a lock acquisition on submit and on complete, and a TaskCompletionSource per wait. Here a
+// transfer costs none of those:
+//
+// - The ring is a fixed array of slots allocated when the endpoint opens. Each slot starts with the OS's own
+//   request record (Linux's usbdevfs_urb, Windows's OVERLAPPED), so the pointer the OS hands back on completion
+//   is the slot itself: no lookup table, no handle.
+// - Slots are used in submission order, so taking completions from the head keeps nusb's ordering guarantee
+//   (completions are seen in submission order, even when the OS finishes them out of order) with no queue.
+// - The only shared state is each slot's `state` word: the completing thread writes the result, then publishes
+//   it with a release store; the owner reads it with an acquire load. No lock anywhere.
+// - A waiter parks on the ring's AsyncSignal; the completer raises it. A raise before the wait is kept, so a
+//   completion between "check" and "wait" is never lost (the C# version re-subscribed a TCS for that).
+
+const SLOT_FREE: u32 = 0;
+const SLOT_PENDING: u32 = 1;
+const SLOT_DONE: u32 = 2;
+
+/// The default number of transfers an endpoint can have in flight at once.
+public const DEFAULT_RING: usize = 32;
+
+/// One transfer's shared record. `native` must stay first: its address is the slot's (see the file comment).
+/// 96 bytes of native room covers a usbdevfs_urb (56 bytes on LP64) and an OVERLAPPED (32 bytes on x64).
+@repr(C)
+struct Slot {
+    native: [u64; 12];
+    state: AtomicU32;
+    status: u32;
+    actual: u32;
+    code: i32;
+    /// The Ring this slot belongs to (a `*Ring`; C layout allows only C types here).
+    ring: *void;
+}
+
+/// The part of an endpoint the completing thread (the event loop) touches. It lives in a Box, so its address is
+/// fixed for the endpoint's life; the endpoint never frees it while the OS holds a transfer (`outstanding` > 0).
+///
+/// Thread-safe by declaration: the event loop writes a slot only between the owner's submit (state PENDING) and
+/// its own release store of DONE; the owner reads it only after an acquire load of DONE. `signal` and
+/// `outstanding` are atomic.
+@threadSafe
+struct Ring {
+    signal: AsyncSignal;
+    outstanding: AtomicU32;
+    slots: Vector<Slot>;
+}
+
+/// A finished transfer: the buffer back, how many bytes moved, and how it ended. A transfer can move bytes and
+/// still fail or be cancelled.
+public struct Completion {
+    public buffer: Buffer;
+    public status: TransferStatus;
+    public actualLength: usize;
+    /// The OS's code for a failure (errno, IOReturn, Win32 error), 0 for none.
+    public code: i32;
+
+    public fn isSuccess(borrow this) -> bool => this.status is TransferStatus.Success;
+
+    /// The buffer if the transfer succeeded, else the error.
+    public fn intoBuffer(this) -> Result<Buffer, UsbError> {
+        if (this.status is TransferStatus.Success) {
+            return Ok(this.buffer);
+        }
+        return Err(transferError(this.status, this.code, Operation.Transfer));
+    }
+}
+
+fn statusCode(status: TransferStatus) -> u32 => match (status) {
+    TransferStatus.Success => 0,
+    TransferStatus.Cancelled => 1,
+    TransferStatus.Stall => 2,
+    TransferStatus.Disconnected => 3,
+    TransferStatus.Fault => 4,
+    TransferStatus.InvalidArgument => 5,
+    TransferStatus.QueueFull => 6,
+    TransferStatus.Unknown => 7,
+};
+
+fn statusFromCode(code: u32) -> TransferStatus => match (code) {
+    0 => TransferStatus.Success,
+    1 => TransferStatus.Cancelled,
+    2 => TransferStatus.Stall,
+    3 => TransferStatus.Disconnected,
+    4 => TransferStatus.Fault,
+    5 => TransferStatus.InvalidArgument,
+    6 => TransferStatus.QueueFull,
+    _ => TransferStatus.Unknown,
+};
+
+/// A ring of `capacity` free slots.
+/// Safety: the slots' back pointers are set after the Box is made, so they hold its final address.
+fn makeRing(capacity: usize) -> Result<Box<Ring>, AllocError> {
+    var slots = Vector<Slot>.withCapacity(capacity)?;
+    for (i in 0..capacity as u64) {
+        slots.push(
+            Slot {
+                native: [0u64; 12],
+                state: AtomicU32.create(SLOT_FREE),
+                status: 0,
+                actual: 0,
+                code: 0,
+                ring: 0 as *void,
+            },
+        )?;
+    }
+    var ring = Box.create(Ring { signal: AsyncSignal.create(), outstanding: AtomicU32.create(0), slots: slots })?;
+    let shared: borrow Ring = borrow ring;
+    let address = shared as *Ring as *void;
+    let all = ring.slots.viewMut();
+    for (j in 0..all.length) {
+        all[j].ring = address;
+    }
+    return Ok(ring);
+}
+
+/// Called by the event loop (or the submitting thread, for a failed submit) when the OS is done with `slot`:
+/// records the result, publishes it, wakes the owner, and lets go of the ring. Nothing touches the ring after the
+/// final decrement, which is what lets the owner free it.
+/// Safety: `slot` is a slot of a live ring in state PENDING that the OS has given back (reaped, its callback
+/// called, or its submit failed); the ring outlives this call because `outstanding` counts this transfer.
+@effects()
+unsafe fn completeSlot(slot: *mut Slot, status: TransferStatus, actual: usize, code: i32) {
+    let s = Ptr.toBorrowMut(slot);
+    s.status = statusCode(status);
+    s.actual = saturatingTruncate<u32>(actual);
+    s.code = code;
+    let ring = Ptr.toBorrow(s.ring as *Ring);
+    s.state.storeWith(SLOT_DONE, StoreOrdering.Release);
+    ring.signal.raise();
+    ring.outstanding.fetchSub(1);
+}

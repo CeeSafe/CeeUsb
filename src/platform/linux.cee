@@ -1,0 +1,1172 @@
+// Linux: usbfs for I/O, sysfs for enumeration, a udev netlink socket for hotplug, one epoll thread for completions.
+//
+// Against the C# backend:
+// - The event loop reaps every finished URB of a device per wakeup (until EAGAIN), not one per epoll_wait.
+// - A URB is the first field of its ring slot, so a submit allocates nothing and a reap finds its slot from the
+//   pointer usbfs returns, with no GCHandle, no context object and no global dictionary under a lock.
+// - Control transfers use USBDEVFS_CONTROL, a single blocking ioctl whose timeout the kernel enforces, instead of
+//   a URB, a userspace timer (timerfd + sorted set under a lock), a heap buffer and a TransferQueue per call.
+// - Enumeration reads each device's sysfs `descriptors` file once (device descriptor + configurations) instead of
+//   a dozen text attributes, and only opens an interface's `interface` file when the interface has a string.
+// - Deregistering a descriptor from the loop needs no lock on the hot path: an epoch counter, bumped by the loop
+//   before each epoll_wait, tells the closer when no stale event for it can still be in hand.
+
+@header("usb_os.h")
+extern "C" {
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn epoll_create1(flags: i32) -> i32;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut u8) -> i32;
+    @cfg("USB_OS_LINUX")
+    fn epoll_wait(epfd: i32, events: *mut u8, maxEvents: i32, timeout: i32) -> i32;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn eventfd(initial: u32, flags: i32) -> i32;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn write(fd: i32, data: *u8, count: usize) -> isize;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn bind(fd: i32, address: *u8, length: u32) -> i32;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn recvfrom(fd: i32, buffer: *mut u8, length: usize, flags: i32, source: *mut u8, sourceLength: *mut u32) -> isize;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn usb_ioctl_prompt(fd: i32, request: CULong, argument: *mut void) -> i32;
+    @cfg("USB_OS_LINUX")
+    @effects()
+    fn readlink(path: *CChar, buffer: *mut u8, size: usize) -> isize;
+}
+
+// usbfs ioctls (LP64: x86-64 and arm64).
+const USBDEVFS_CONTROL: u32 = 0xC0185500;
+const USBDEVFS_SETINTERFACE: u32 = 0x80085504;
+const USBDEVFS_SETCONFIGURATION: u32 = 0x80045505;
+const USBDEVFS_SUBMITURB: u32 = 0x8038550A;
+const USBDEVFS_DISCARDURB: u32 = 0x0000550B;
+const USBDEVFS_REAPURBNDELAY: u32 = 0x4008550D;
+const USBDEVFS_CLAIMINTERFACE: u32 = 0x8004550F;
+const USBDEVFS_RELEASEINTERFACE: u32 = 0x80045510;
+const USBDEVFS_IOCTL: u32 = 0xC0105512;
+const USBDEVFS_RESET: u32 = 0x00005514;
+const USBDEVFS_CLEAR_HALT: u32 = 0x80045515;
+const USBDEVFS_DISCONNECT: i32 = 0x00005516;
+const USBDEVFS_CONNECT: i32 = 0x00005517;
+const USBDEVFS_DISCONNECT_CLAIM: u32 = 0x8108551B;
+const USBDEVFS_GET_SPEED: u32 = 0x0000551F;
+const DISCONNECT_CLAIM_EXCEPT_DRIVER: u32 = 2;
+
+const URB_TYPE_INTERRUPT: u8 = 1;
+const URB_TYPE_BULK: u8 = 3;
+
+const O_RDWR_CLOEXEC: i32 = 0x80002;
+const O_CLOEXEC: i32 = 0x80000;
+const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_DEL: i32 = 2;
+const EPOLLIN: u32 = 1;
+const EPOLLOUT: u32 = 4;
+const EFD_CLOEXEC_NONBLOCK: i32 = 0x80800;
+const AF_NETLINK: i32 = 16;
+const SOCK_RAW_CLOEXEC_NONBLOCK: i32 = 0x80803; // SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK
+const NETLINK_KOBJECT_UEVENT: i32 = 15;
+const MSG_DONTWAIT: i32 = 0x40;
+const UDEV_GROUP: u32 = 2;
+
+const EPERM: i32 = 1;
+const ENOENT: i32 = 2;
+const EINTR: i32 = 4;
+const EAGAIN: i32 = 11;
+const EACCES: i32 = 13;
+const EBUSY: i32 = 16;
+const ENODEV: i32 = 19;
+const EINVAL: i32 = 22;
+const EPIPE: i32 = 32;
+const ENODATA: i32 = 61;
+const ETIME: i32 = 62;
+const ECOMM: i32 = 70;
+const EPROTO: i32 = 71;
+const EOVERFLOW: i32 = 75;
+const EILSEQ: i32 = 84;
+const ECONNRESET: i32 = 104;
+const ESHUTDOWN: i32 = 108;
+const ETIMEDOUT: i32 = 110;
+const EREMOTEIO: i32 = 121;
+
+/// struct usbdevfs_urb (56 bytes on LP64); lives at the start of a ring Slot.
+@repr(C)
+struct Urb {
+    kind: u8;
+    endpoint: u8;
+    status: i32;
+    flags: u32;
+    buffer: *mut u8;
+    bufferLength: i32;
+    actualLength: i32;
+    startFrame: i32;
+    packets: i32;
+    errorCount: i32;
+    signr: u32;
+    userContext: *mut void;
+}
+
+/// struct usbdevfs_ctrltransfer
+@repr(C)
+struct CtrlTransfer {
+    requestType: u8;
+    request: u8;
+    value: u16;
+    index: u16;
+    length: u16;
+    timeout: u32;
+    data: *mut u8;
+}
+
+/// struct usbdevfs_setinterface
+@repr(C)
+struct SetInterface {
+    number: u32;
+    alt: u32;
+}
+
+/// struct usbdevfs_ioctl
+@repr(C)
+struct IoctlWrap {
+    number: i32;
+    code: i32;
+    data: *mut void;
+}
+
+/// struct usbdevfs_disconnect_claim
+@repr(C)
+struct DisconnectClaim {
+    number: u32;
+    flags: u32;
+    driver: [u8; 256];
+}
+
+// ---- The event loop -------------------------------------------------------------------------------------------
+
+const TARGET_WAKE: u32 = 0;
+const TARGET_DEVICE: u32 = 1;
+const TARGET_HOTPLUG: u32 = 2;
+
+/// What an epoll registration points at: its `u64` data is this record's address. The record is boxed by its
+/// owner and outlives the registration (see `unregister`).
+@repr(C)
+struct EventTarget {
+    kind: u32;
+    fd: i32;
+    /// Set by the loop when usbfs says the device is gone (ENODEV): the loop dropped the registration itself.
+    gone: AtomicU32;
+    /// TARGET_HOTPLUG: the watcher's `HotplugSink`.
+    sink: *void;
+}
+
+static LOOP_STATE: AtomicU32 = AtomicU32.constant(0); // 0 not started, 1 starting, 2 running, 3 failed
+static EPOLL_FD: AtomicU32 = AtomicU32.constant(0);
+static WAKE_FD: AtomicU32 = AtomicU32.constant(0);
+static EPOCH: AtomicU64 = AtomicU64.constant(0);
+static WAKE_TARGET: AtomicU64 = AtomicU64.constant(0);
+
+/// Starts the epoll thread once per process; the epoll descriptor, or the error.
+/// Safety: plain syscalls; the wake target is leaked on purpose (it lives as long as the loop, the process).
+fn ensureLoop() -> Result<i32, UsbError> {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            loop {
+                match (LOOP_STATE.compareExchange(0, 1)) {
+                    Ok(_) => {
+                        let ep = unsafe { epoll_create1(O_CLOEXEC) };
+                        if (ep < 0) {
+                            LOOP_STATE.store(3);
+                            return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, lastError()));
+                        }
+                        let wake = unsafe { eventfd(0, EFD_CLOEXEC_NONBLOCK) };
+                        if (wake < 0) {
+                            LOOP_STATE.store(3);
+                            return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, lastError()));
+                        }
+                        let target = match (Box.create(
+                            EventTarget { kind: TARGET_WAKE, fd: wake, gone: AtomicU32.create(0), sink: 0 as *void },
+                        )) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                LOOP_STATE.store(3);
+                                return Err(UsbError.noMemory(Operation.EventLoop));
+                            }
+                        };
+                        let raw = Box.intoRaw(target);
+                        WAKE_TARGET.store(raw as usize as u64);
+                        EPOLL_FD.store(truncate<u32>(ep));
+                        WAKE_FD.store(truncate<u32>(wake));
+                        if (!addFd(ep, wake, EPOLLIN, raw as *EventTarget)) {
+                            LOOP_STATE.store(3);
+                            return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, lastError()));
+                        }
+                        if (!startThread(loopMain, loopMainWindows)) {
+                            LOOP_STATE.store(3);
+                            return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, lastError()));
+                        }
+                        LOOP_STATE.store(2);
+                        return Ok(ep);
+                    }
+                    Err(state) => {
+                        if (state == 2) {
+                            return Ok(truncate<i32>(EPOLL_FD.load()));
+                        }
+                        if (state == 3) {
+                            return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, 0));
+                        }
+                        yieldThread();
+                    }
+                }
+            }
+        }
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.EventLoop, 0));
+}
+
+/// The epoll_event layout differs: packed (12 bytes, data at 4) on x86-64, natural (16, data at 8) elsewhere.
+fn eventSize() -> usize {
+    var size: usize = 16;
+    if (cfg("USB_EPOLL_PACKED")) {
+        size = 12;
+    }
+    return size;
+}
+
+fn eventDataOffset() -> usize {
+    var at: usize = 8;
+    if (cfg("USB_EPOLL_PACKED")) {
+        at = 4;
+    }
+    return at;
+}
+
+/// Registers `fd` with the loop, its events pointing at `target`.
+/// Safety: `target` outlives the registration.
+fn addFd(ep: i32, fd: i32, events: u32, target: *EventTarget) -> bool {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            var e = [0u8; 16];
+            e[..].writeLE(0, events);
+            e[..].writeLE(eventDataOffset(), target as usize as u64);
+            return unsafe { epoll_ctl(ep, EPOLL_CTL_ADD, fd, borrow mut e[0] as *mut u8) } == 0;
+        }
+    }
+    return false;
+}
+
+/// Registers a boxed target with the loop.
+fn register(target: borrow EventTarget, events: u32, operation: Operation) -> Result<void, UsbError> {
+    let ep = ensureLoop()?;
+    if (!addFd(ep, target.fd, events, target as *EventTarget)) {
+        return Err(UsbError.create(ErrorKind.Other, operation, lastError()));
+    }
+    return Ok();
+}
+
+/// Removes `target` from the loop and returns once the loop can no longer be using it: after the removal, the
+/// loop's next pass through epoll_wait cannot return it, so waiting for the epoch to move past the current pass
+/// (waking the loop so it does) is enough. Then the owner may close the descriptor and free the target.
+/// Safety: plain syscalls; the eventfd write wakes the loop.
+fn unregister(target: borrow EventTarget) {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            if (LOOP_STATE.load() != 2) {
+                return;
+            }
+            let ep = truncate<i32>(EPOLL_FD.load());
+            if (target.gone.load() == 0) {
+                unsafe { epoll_ctl(ep, EPOLL_CTL_DEL, target.fd, 0 as *mut u8); }
+            }
+            let seen = EPOCH.load();
+            let one = [1u8, 0, 0, 0, 0, 0, 0, 0];
+            unsafe { write(truncate<i32>(WAKE_FD.load()), borrow one[0] as *u8, 8); }
+            var spins: u32 = 0;
+            while (EPOCH.load() == seen) {
+                spins += 1;
+                if (spins < 64) {
+                    yieldThread();
+                } else {
+                    sleepMs(1);
+                }
+            }
+        }
+    }
+}
+
+/// The loop thread's body (pthread's signature).
+/// Safety: every target pointer in epoll was registered by `register` and is alive until `unregister` returns,
+/// which waits for this loop to pass the epoch it was removed in.
+@callback
+fn loopMain(argument: *mut void) -> *mut void {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            let ep = truncate<i32>(EPOLL_FD.load());
+            let size = eventSize();
+            let at = eventDataOffset();
+            var events = [0u8; 1024];
+            let capacity = truncate<i32>(events.length / size);
+            loop {
+                EPOCH.fetchAdd(1);
+                let n = unsafe { epoll_wait(ep, borrow mut events[0] as *mut u8, capacity, -1) };
+                if (n < 0) {
+                    if (lastError() == EINTR) {
+                        continue;
+                    }
+                    traceNumber(
+                        TraceLevel.Error,
+                        "epoll_wait failed; the event loop stops, errno",
+                        truncate<u64>(lastError()),
+                    );
+                    LOOP_STATE.store(3);
+                    break;
+                }
+                for (i in 0..(truncate<usize>(n))) {
+                    let data = events[..].readLE<u64>(i * size + at);
+                    let target = unsafe { Ptr.toBorrow(truncate<usize>(data) as *EventTarget) };
+                    if (target.kind == TARGET_DEVICE) {
+                        reapAll(target, ep);
+                    } else if (target.kind == TARGET_HOTPLUG) {
+                        drainHotplug(target);
+                    } else {
+                        var drained = [0u8; 8];
+                        unsafe { read(target.fd, borrow mut drained[0] as *mut u8, 8); }
+                    }
+                }
+            }
+        }
+    }
+    return 0 as *mut void;
+}
+
+/// Windows's thread signature; never started on Linux, but `startThread` takes both.
+@callback
+fn loopMainWindows(argument: *mut void) -> u32 => 0;
+
+/// Reaps every finished URB of one device and completes its slot.
+/// Safety: a reaped URB pointer is the address of a ring Slot submitted on this descriptor (see transfer.cee);
+/// its ring is alive while it counts the URB in `outstanding`.
+fn reapAll(target: borrow EventTarget, ep: i32) {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            loop {
+                var urb: *mut void = 0 as *mut void;
+                let r = unsafe { usb_ioctl_prompt(
+                    target.fd,
+                    USBDEVFS_REAPURBNDELAY as CULong,
+                    borrow mut urb as *mut *mut void as *mut void,
+                ) };
+                if (r < 0) {
+                    let errno = lastError();
+                    if (errno == ENODEV) {
+                        // Gone: every URB has been given back above (usbfs completes them before it says ENODEV);
+                        // stop the level-triggered hang-up from spinning the loop.
+                        target.gone.store(1);
+                        unsafe { epoll_ctl(ep, EPOLL_CTL_DEL, target.fd, 0 as *mut u8); }
+                    }
+                    return;
+                }
+                let u = unsafe { Ptr.toBorrow(urb as *Urb) };
+                let status = statusFromErrno(0 - u.status);
+                let actual = if (u.actualLength > 0) truncate<usize>(u.actualLength) else 0;
+                let code = if (u.status == 0) 0 else 0 - u.status;
+                unsafe { completeSlot(urb as *mut Slot, status, actual, code); }
+            }
+        }
+    }
+}
+
+/// A URB's status (a positive errno) as a TransferStatus.
+fn statusFromErrno(errno: i32) -> TransferStatus => match (errno) {
+    0 => TransferStatus.Success,
+    ENODEV | ESHUTDOWN => TransferStatus.Disconnected,
+    EPIPE => TransferStatus.Stall,
+    ENOENT | ECONNRESET | ETIMEDOUT => TransferStatus.Cancelled,
+    EPROTO | EILSEQ | EOVERFLOW | ECOMM | ETIME | EREMOTEIO => TransferStatus.Fault,
+    EINVAL => TransferStatus.InvalidArgument,
+    _ => TransferStatus.Unknown,
+};
+
+/// An errno from a control-plane call as an ErrorKind.
+fn kindFromErrno(errno: i32) -> ErrorKind => match (errno) {
+    ENODEV | ESHUTDOWN => ErrorKind.Disconnected,
+    EBUSY => ErrorKind.Busy,
+    EPERM | EACCES => ErrorKind.PermissionDenied,
+    ENOENT | EINVAL => ErrorKind.NotFound,
+    ETIMEDOUT => ErrorKind.TimedOut,
+    _ => ErrorKind.Other,
+};
+
+fn errnoError(operation: Operation) -> UsbError {
+    let errno = lastError();
+    return UsbError.create(kindFromErrno(errno), operation, errno);
+}
+
+// ---- Device operations ----------------------------------------------------------------------------------------
+
+/// What `linuxOpen` gives the device: its descriptor, its descriptors blob, its speed and its loop registration.
+struct LinuxOpened {
+    fd: i32;
+    blob: Vector<u8>;
+    speed: Speed?;
+    target: Box<EventTarget>;
+}
+
+/// Opens /dev/bus/usb/BBB/DDD, reads its descriptors and registers it with the loop.
+/// Safety: plain syscalls on a descriptor this function owns until it returns it.
+fn linuxOpen(bus: u8, address: u8) -> Result<LinuxOpened, UsbError> {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            var path = [0u8; 32];
+            var w = TextWriter.create(mut path[..]);
+            w.text("/dev/bus/usb/");
+            pad3(mut w, bus);
+            w.text("/");
+            pad3(mut w, address);
+            let fd = unsafe { open(w.cText(), O_RDWR_CLOEXEC) };
+            if (fd < 0) {
+                let errno = lastError();
+                let kind = if (errno == ENOENT) ErrorKind.Disconnected else kindFromErrno(errno);
+                return Err(UsbError.create(kind, Operation.Open, errno));
+            }
+            // The device file holds the device descriptor and every configuration, back to back.
+            var blob = Vector<u8>.create();
+            loop {
+                if (blob.reserve(4096).isErr()) {
+                    unsafe { close(fd); }
+                    return Err(UsbError.noMemory(Operation.Open));
+                }
+                let at = blob.length;
+                let n = unsafe { read(fd, blob.viewMut().ptr.add(at), blob.capacity - at) };
+                if (n < 0) {
+                    if (lastError() == EINTR) {
+                        continue;
+                    }
+                    let e = errnoError(Operation.ReadDescriptors);
+                    unsafe { close(fd); }
+                    return Err(e);
+                }
+                if (n == 0) {
+                    break;
+                }
+                unsafe { blob.setLength(at + (truncate<usize>(n))); }
+            }
+            let speed = match (unsafe { ioctl(fd, USBDEVFS_GET_SPEED as CULong) }) {
+                1 => Some(Speed.Low),
+                2 => Some(Speed.Full),
+                3 => Some(Speed.High),
+                5 => Some(Speed.Super),
+                6 => Some(Speed.SuperPlus),
+                _ => null,
+            };
+            let target = match (Box.create(
+                EventTarget { kind: TARGET_DEVICE, fd: fd, gone: AtomicU32.create(0), sink: 0 as *void },
+            )) {
+                Ok(t) => t,
+                Err(_) => {
+                    unsafe { close(fd); }
+                    return Err(UsbError.noMemory(Operation.Open));
+                }
+            };
+            match (register(borrow target, EPOLLOUT, Operation.Open)) {
+                Ok() => {}
+                Err(e) => {
+                    unsafe { close(fd); }
+                    return Err(e);
+                }
+            }
+            return Ok(LinuxOpened { fd: fd, blob: blob, speed: speed, target: target });
+        }
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.Open, 0));
+}
+
+fn pad3<region r>(w: borrow mut TextWriter<r>, n: u8) {
+    if (n < 100) {
+        w.text("0");
+    }
+    if (n < 10) {
+        w.text("0");
+    }
+    w.decimal(n as u64);
+}
+
+/// Closes a device: out of the loop first, then the descriptor (which releases its interfaces).
+/// Safety: the loop no longer uses the target once `unregister` returns.
+fn linuxClose(fd: i32, target: borrow EventTarget) {
+    if (cfg("USB_OS_POSIX")) {
+        unregister(target);
+        unsafe { close(fd); }
+    }
+}
+
+/// Runs a usbfs ioctl whose argument is a pointer, as a Result.
+/// Safety: callers pass a request with the matching argument struct.
+fn usbfs(fd: i32, request: u32, argument: *mut void, operation: Operation) -> Result<i32, UsbError> {
+    if (cfg("USB_OS_POSIX")) {
+        let r = unsafe { ioctl(fd, request as CULong, argument) };
+        if (r < 0) {
+            return Err(errnoError(operation));
+        }
+        return Ok(r);
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, operation, 0));
+}
+
+fn linuxSetConfiguration(fd: i32, value: u8) -> Result<void, UsbError> {
+    var v: u32 = value as u32;
+    usbfs(fd, USBDEVFS_SETCONFIGURATION, borrow mut v as *mut u32 as *mut void, Operation.SetConfiguration)?;
+    return Ok();
+}
+
+fn linuxReset(fd: i32) -> Result<void, UsbError> {
+    usbfs(fd, USBDEVFS_RESET, 0 as *mut void, Operation.Reset)?;
+    return Ok();
+}
+
+fn linuxDriverIoctl(fd: i32, number: u8, code: i32, operation: Operation) -> Result<void, UsbError> {
+    var request = IoctlWrap { number: number as i32, code: code, data: 0 as *mut void };
+    match (usbfs(fd, USBDEVFS_IOCTL, borrow mut request as *mut IoctlWrap as *mut void, operation)) {
+        Ok(_) => {
+            return Ok();
+        }
+        Err(e) => {
+            // ENODATA: no driver to detach.
+            return Err(if (e.code == ENODATA) UsbError.create(ErrorKind.NotFound, operation, e.code) else e);
+        }
+    }
+}
+
+fn linuxDetach(fd: i32, number: u8) -> Result<void, UsbError> =>
+    linuxDriverIoctl(fd, number, USBDEVFS_DISCONNECT, Operation.DetachDriver);
+
+fn linuxAttach(fd: i32, number: u8) -> Result<void, UsbError> =>
+    linuxDriverIoctl(fd, number, USBDEVFS_CONNECT, Operation.AttachDriver);
+
+/// Claims an interface; with `detach`, atomically disconnects whatever kernel driver holds it (but not usbfs).
+fn linuxClaim(fd: i32, number: u8, detach: bool) -> Result<void, UsbError> {
+    if (detach) {
+        var claim = DisconnectClaim {
+            number: number as u32,
+            flags: DISCONNECT_CLAIM_EXCEPT_DRIVER,
+            driver: [0u8; 256],
+        };
+        claim.driver[0] = 'u';
+        claim.driver[1] = 's';
+        claim.driver[2] = 'b';
+        claim.driver[3] = 'f';
+        claim.driver[4] = 's';
+        usbfs(
+            fd,
+            USBDEVFS_DISCONNECT_CLAIM,
+            borrow mut claim as *mut DisconnectClaim as *mut void,
+            Operation.ClaimInterface,
+        )?;
+    } else {
+        var n: u32 = number as u32;
+        usbfs(fd, USBDEVFS_CLAIMINTERFACE, borrow mut n as *mut u32 as *mut void, Operation.ClaimInterface)?;
+    }
+    return Ok();
+}
+
+fn linuxRelease(fd: i32, number: u8) {
+    var n: u32 = number as u32;
+    let _ = usbfs(fd, USBDEVFS_RELEASEINTERFACE, borrow mut n as *mut u32 as *mut void, Operation.ClaimInterface);
+}
+
+fn linuxSetInterface(fd: i32, number: u8, alt: u8) -> Result<void, UsbError> {
+    var request = SetInterface { number: number as u32, alt: alt as u32 };
+    usbfs(fd, USBDEVFS_SETINTERFACE, borrow mut request as *mut SetInterface as *mut void, Operation.SetAltSetting)?;
+    return Ok();
+}
+
+fn linuxClearHalt(fd: i32, address: u8) -> Result<void, UsbError> {
+    var a: u32 = address as u32;
+    usbfs(fd, USBDEVFS_CLEAR_HALT, borrow mut a as *mut u32 as *mut void, Operation.ClearHalt)?;
+    return Ok();
+}
+
+/// A control transfer, synchronously; the kernel enforces the timeout (0: none). The data stage is `data`: read
+/// into for IN, sent for OUT. The bytes transferred.
+fn linuxControl(
+    fd: i32,
+    requestType: u8,
+    request: ControlRequest,
+    data: *mut u8,
+    length: u16,
+    timeoutMs: u32,
+) -> Result<usize, UsbError> {
+    var c = CtrlTransfer {
+        requestType: requestType,
+        request: request.request,
+        value: request.value,
+        index: request.index,
+        length: length,
+        timeout: timeoutMs,
+        data: data,
+    };
+    match (usbfs(fd, USBDEVFS_CONTROL, borrow mut c as *mut CtrlTransfer as *mut void, Operation.ControlTransfer)) {
+        Ok(n) => {
+            return Ok(truncate<usize>(n));
+        }
+        Err(e) => {
+            let kind = match (e.code) {
+                ETIMEDOUT => ErrorKind.TimedOut,
+                EPIPE => ErrorKind.Other,
+                _ => e.kind,
+            };
+            return Err(UsbError.create(kind, Operation.ControlTransfer, e.code));
+        }
+    }
+}
+
+/// Submits the URB in `slot`. On failure the slot is completed with the error at once, so it is reported in order.
+/// Safety: `slot` is a FREE slot of a live ring, now owned by the OS until reaped; `buffer` stays alive and
+/// unmoved until then (the endpoint keeps it).
+fn linuxSubmit(fd: i32, slot: *mut Slot, endpoint: u8, interrupt: bool, buffer: *mut u8, length: usize) {
+    if (cfg("USB_OS_LINUX")) {
+        let u = unsafe { Ptr.toBorrowMut(slot as *mut Urb) };
+        u.kind = if (interrupt) URB_TYPE_INTERRUPT else URB_TYPE_BULK;
+        u.endpoint = endpoint;
+        u.status = 0;
+        u.flags = 0;
+        u.buffer = buffer;
+        u.bufferLength = saturatingTruncate<i32>(length);
+        u.actualLength = 0;
+        u.startFrame = 0;
+        u.packets = 0;
+        u.errorCount = 0;
+        u.signr = 0;
+        u.userContext = slot as *mut void;
+        if (unsafe { usb_ioctl_prompt(fd, USBDEVFS_SUBMITURB as CULong, slot as *mut void) } < 0) {
+            let errno = lastError();
+            let status = statusFromErrno(errno);
+            traceNumber(TraceLevel.Warn, "SUBMITURB failed, errno", truncate<u64>(errno));
+            unsafe {
+                completeSlot(slot, if (status is TransferStatus.Success) TransferStatus.Unknown else status, 0, errno);
+            }
+        }
+    }
+}
+
+/// Asks usbfs to give a pending URB back early (as Cancelled). Harmless if it already finished.
+/// Safety: the slot is not reused before it is taken, so its address names this URB or none.
+fn linuxDiscard(fd: i32, slot: *mut Slot) {
+    if (cfg("USB_OS_LINUX")) {
+        unsafe { usb_ioctl_prompt(fd, USBDEVFS_DISCARDURB as CULong, slot as *mut void); }
+    }
+}
+
+/// bConfigurationValue from sysfs; 0 when unconfigured, null if unreadable.
+fn linuxActiveConfiguration(sysfsPath: StringView) -> u8? {
+    var buffer = [0u8; 16];
+    let n = readAttribute(sysfsPath, "bConfigurationValue", mut buffer[..])?;
+    let text = StringView.fromUtf8(buffer[0..n])?.trim();
+    if (text.length == 0) {
+        return Some(0);
+    }
+    return text.parseInt<u8>();
+}
+
+// ---- Enumeration ----------------------------------------------------------------------------------------------
+
+const SYSFS_DEVICES: StringView = "/sys/bus/usb/devices";
+
+/// Reads `<directory>/<name>` into `into`; the byte count, or null if it cannot be read.
+fn readAttribute(directory: StringView, name: StringView, into: SliceMut<u8>) -> usize? {
+    var path = [0u8; 512];
+    var w = TextWriter.create(mut path[..]);
+    w.text(directory);
+    w.text("/");
+    w.text(name);
+    if (w.truncated()) {
+        return null;
+    }
+    let p = StringView.fromUtf8(w.written())?;
+    var file = match (File.open(p)) {
+        Ok(f) => f,
+        Err(_) => {
+            return null;
+        }
+    };
+    var total: usize = 0;
+    while (total < into.length) {
+        match (file.read(mut into[total..])) {
+            Ok(0) => {
+                break;
+            }
+            Ok(n) => {
+                total += n;
+            }
+            Err(_) => {
+                return null;
+            }
+        }
+    }
+    return Some(total);
+}
+
+/// An attribute's text, trimmed, or null if missing or empty.
+fn attributeString(directory: StringView, name: StringView) -> Result<String?, AllocError> {
+    var buffer = [0u8; 256];
+    match (readAttribute(directory, name, mut buffer[..])) {
+        Some(n) => {
+            match (StringView.fromUtf8(buffer[0..n])) {
+                Some(text) => {
+                    return optionalString(text);
+                }
+                null => {
+                    return Ok(null);
+                }
+            }
+        }
+        null => {
+            return Ok(null);
+        }
+    }
+}
+
+/// An attribute as a decimal number.
+fn attributeNumber(directory: StringView, name: StringView) -> u64? {
+    var buffer = [0u8; 32];
+    let n = readAttribute(directory, name, mut buffer[..])?;
+    return StringView.fromUtf8(buffer[0..n])?.trim().parseInt<u64>();
+}
+
+/// Is a sysfs entry name a device ("1-6", "1-6.4.2"), not a root hub ("usb1") or an interface ("1-6:1.0")?
+fn isDeviceName(name: StringView) -> bool {
+    if (name.length == 0) {
+        return false;
+    }
+    for (b in name.bytes()) {
+        if (!((b >= '0' && b <= '9') || b == '-' || b == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn linuxListDevices(out: borrow mut Vector<DeviceInfo>) -> Result<void, UsbError> {
+    let names = match (Directory.list(SYSFS_DEVICES)) {
+        Ok(n) => n,
+        Err(_) => {
+            return Ok();
+        }
+    };
+    var path = String.create();
+    for (name in names.view()) {
+        if (!isDeviceName(name.view())) {
+            continue;
+        }
+        path.clear();
+        appendAll(mut path, SYSFS_DEVICES, "/", name.view())?;
+        match (linuxProbe(path.view())) {
+            Ok(Some(info)) => {
+                if (out.push(info).isErr()) {
+                    return Err(UsbError.noMemory(Operation.Enumerate));
+                }
+            }
+            Ok(null) => {
+                trace(TraceLevel.Debug, "enumeration skipped", path.view(), null);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+    return Ok();
+}
+
+fn appendAll(s: borrow mut String, a: StringView, b: StringView, c: StringView) -> Result<void, UsbError> {
+    match (s.append(a)) {
+        Ok() => {}
+        Err(_) => {
+            return Err(UsbError.noMemory(Operation.Enumerate));
+        }
+    }
+    match (s.append(b)) {
+        Ok() => {}
+        Err(_) => {
+            return Err(UsbError.noMemory(Operation.Enumerate));
+        }
+    }
+    match (s.append(c)) {
+        Ok() => {}
+        Err(_) => {
+            return Err(UsbError.noMemory(Operation.Enumerate));
+        }
+    }
+    return Ok();
+}
+
+/// A device's info from its sysfs directory, or null if it is not (or no longer) a readable device.
+fn linuxProbe(directory: StringView) -> Result<DeviceInfo?, UsbError> {
+    match (probeInner(directory)) {
+        Ok(info) => {
+            return Ok(info);
+        }
+        Err(_) => {
+            return Err(UsbError.noMemory(Operation.Enumerate));
+        }
+    }
+}
+
+fn probeInner(directory: StringView) -> Result<DeviceInfo?, AllocError> {
+    let busnum = match (attributeNumber(directory, "busnum")) {
+        Some(n) => truncate<u8>(n),
+        null => {
+            return Ok(null);
+        }
+    };
+    let devnum = match (attributeNumber(directory, "devnum")) {
+        Some(n) => truncate<u8>(n),
+        null => {
+            return Ok(null);
+        }
+    };
+    // One read: the device descriptor, then the configurations, as the kernel cached them.
+    var blob = [0u8; 4096];
+    let length = readAttribute(directory, "descriptors", mut blob[..]) ?? 0;
+    let device = match (DeviceDescriptor.parse(blob[0..length])) {
+        Some(d) => d,
+        null => {
+            return Ok(null);
+        }
+    };
+    var speedText = [0u8; 16];
+    let speed = match (readAttribute(directory, "speed", mut speedText[..])) {
+        Some(n) => speedFromText(StringView.fromUtf8(speedText[0..n]) ?? ""),
+        null => null,
+    };
+    var chain = Vector<u8>.create();
+    var devpath = [0u8; 64];
+    match (readAttribute(directory, "devpath", mut devpath[..])) {
+        Some(n) => {
+            let text = (StringView.fromUtf8(devpath[0..n]) ?? "").trim();
+            if (text != "0") {
+                for (part in text.split(".")) {
+                    match (part.parseInt<u8>()) {
+                        Some(port) => {
+                            chain.push(port)?;
+                        }
+                        null => {}
+                    }
+                }
+            }
+        }
+        null => {}
+    }
+    var busId = String.create();
+    var digits = [0u8; 4];
+    var dw = TextWriter.create(mut digits[..]);
+    pad3(mut dw, busnum);
+    busId.append(StringView.fromUtf8(dw.written())!)?;
+
+    var interfaces = Vector<InterfaceInfo>.create();
+    let active = linuxActiveConfiguration(directory) ?? 0;
+    var configs = ConfigurationIter.over(blob[18..length]);
+    let name = directory[(directory.lastIndexOf("/") ?? 0) + 1..];
+    for (c in configs) {
+        if (c.value() != active) {
+            continue;
+        }
+        var groups = c.interfaces();
+        for (g in groups) {
+            let first = g.first();
+            var label: String? = null;
+            if (first.stringIndex() != 0) {
+                // "<device>:<config>.<interface>/interface"
+                var sub = [0u8; 300];
+                var sw = TextWriter.create(mut sub[..]);
+                sw.text(directory);
+                sw.text("/");
+                sw.text(name);
+                sw.text(":");
+                sw.decimal(active as u64);
+                sw.text(".");
+                sw.decimal(g.number as u64);
+                match (StringView.fromUtf8(sw.written())) {
+                    Some(d) => {
+                        label = attributeString(d, "interface")?;
+                    }
+                    null => {}
+                }
+            }
+            interfaces.push(InterfaceInfo {
+                number: g.number,
+                interfaceClass: first.interfaceClass(),
+                interfaceSubclass: first.interfaceSubclass(),
+                interfaceProtocol: first.interfaceProtocol(),
+                name: label,
+            })?;
+        }
+        break;
+    }
+
+    let lastPort = (if (chain.length > 0) chain[chain.length - 1] else 0) as u32;
+    return Ok(Some(DeviceInfo {
+        id: DeviceId { value: ((busnum as u64) << 8) | devnum as u64 },
+        busId: busId,
+        address: devnum,
+        portChain: chain,
+        vendorId: device.vendorId(),
+        productId: device.productId(),
+        deviceVersion: device.deviceVersion(),
+        usbVersion: device.usbVersion(),
+        deviceClass: device.deviceClass(),
+        deviceSubclass: device.deviceSubclass(),
+        deviceProtocol: device.deviceProtocol(),
+        speed: speed,
+        manufacturer: if (device.manufacturerIndex() != 0) attributeString(directory, "manufacturer")? else null,
+        product: if (device.productIndex() != 0) attributeString(directory, "product")? else null,
+        serialNumber: if (device.serialIndex() != 0) attributeString(directory, "serial")? else null,
+        interfaces: interfaces,
+        path: String.from(directory)?,
+        busNumber: busnum,
+        registryId: 0,
+        port: lastPort,
+        parentId: null,
+        locationId: 0,
+        driver: null,
+    }));
+}
+
+fn linuxListBuses(out: borrow mut Vector<BusInfo>) -> Result<void, UsbError> {
+    match (listBusesInner(out)) {
+        Ok() => {
+            return Ok();
+        }
+        Err(_) => {
+            return Err(UsbError.noMemory(Operation.Enumerate));
+        }
+    }
+}
+
+/// Safety: readlink writes at most the buffer's length.
+fn listBusesInner(out: borrow mut Vector<BusInfo>) -> Result<void, AllocError> {
+    let names = match (Directory.list(SYSFS_DEVICES)) {
+        Ok(n) => n,
+        Err(_) => {
+            return Ok();
+        }
+    };
+    for (name in names.view()) {
+        if (!name.view().startsWith("usb")) {
+            continue;
+        }
+        var path = String.create();
+        path.append(SYSFS_DEVICES)?;
+        path.append("/")?;
+        path.append(name.view())?;
+        let busnum = attributeNumber(path.view(), "busnum") ?? 0;
+        var busId = String.create();
+        var digits = [0u8; 4];
+        var dw = TextWriter.create(mut digits[..]);
+        pad3(mut dw, truncate<u8>(busnum));
+        busId.append(StringView.fromUtf8(dw.written())!)?;
+        // The controller is the root hub's parent; its driver is the `driver` link's last part.
+        var driver: String? = null;
+        if (cfg("USB_OS_POSIX")) {
+            if (cfg("USB_OS_LINUX")) {
+                var link = [0u8; 300];
+                var lw = TextWriter.create(mut link[..]);
+                lw.text(path.view());
+                lw.text("/../driver");
+                var target = [0u8; 256];
+                let n = unsafe { readlink(lw.cText(), borrow mut target[0] as *mut u8, target.length) };
+                if (n > 0) {
+                    let t = StringView.fromUtf8(target[0..(truncate<usize>(n))]) ?? "";
+                    driver = optionalString(t[(t.lastIndexOf("/") ?? 0) + 1..])?;
+                }
+            }
+        }
+        let kind = match (borrow driver) {
+            Some(d) => controllerTypeFromName(d.view()),
+            null => null,
+        };
+        out.push(BusInfo {
+            busId: busId,
+            controllerType: kind,
+            driver: driver,
+            name: attributeString(path.view(), "product")?,
+            path: path,
+            registryId: 0,
+            locationId: 0,
+        })?;
+    }
+    return Ok();
+}
+
+// ---- Hotplug --------------------------------------------------------------------------------------------------
+
+/// Where the loop puts hotplug events: the watcher's channel. Boxed by the watcher, alive until it unregisters.
+struct HotplugSink {
+    channel: Channel<HotplugEvent>;
+}
+
+/// Opens the udev netlink socket and registers it with the loop.
+/// Safety: plain syscalls; `sockaddr_nl` is 12 bytes: family u16, pad u16, pid u32, groups u32.
+fn linuxHotplugOpen(sink: *void) -> Result<Box<EventTarget>, UsbError> {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            let fd = unsafe { socket(AF_NETLINK, SOCK_RAW_CLOEXEC_NONBLOCK, NETLINK_KOBJECT_UEVENT) };
+            if (fd < 0) {
+                return Err(errnoError(Operation.Hotplug));
+            }
+            var address = [0u8; 12];
+            address[..].writeLE(0, truncate<u16>(AF_NETLINK));
+            address[..].writeLE(8, UDEV_GROUP);
+            if (unsafe { bind(fd, borrow address[0] as *u8, 12) } < 0) {
+                let e = errnoError(Operation.Hotplug);
+                unsafe { close(fd); }
+                return Err(e);
+            }
+            let target = match (Box.create(
+                EventTarget { kind: TARGET_HOTPLUG, fd: fd, gone: AtomicU32.create(0), sink: sink },
+            )) {
+                Ok(t) => t,
+                Err(_) => {
+                    unsafe { close(fd); }
+                    return Err(UsbError.noMemory(Operation.Hotplug));
+                }
+            };
+            match (register(borrow target, EPOLLIN, Operation.Hotplug)) {
+                Ok() => {}
+                Err(e) => {
+                    unsafe { close(fd); }
+                    return Err(e);
+                }
+            }
+            return Ok(target);
+        }
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.Hotplug, 0));
+}
+
+/// Safety: the loop no longer uses the target once `unregister` returns, so the descriptor may close.
+fn linuxHotplugClose(target: borrow EventTarget) {
+    if (cfg("USB_OS_POSIX")) {
+        unregister(target);
+        unsafe { close(target.fd); }
+    }
+}
+
+/// Reads every queued uevent and forwards the USB device ones.
+/// Safety: the sink is alive while the target is registered.
+fn drainHotplug(target: borrow EventTarget) {
+    if (cfg("USB_OS_POSIX")) {
+        if (cfg("USB_OS_LINUX")) {
+            let sink = unsafe { Ptr.toBorrow(target.sink as *HotplugSink) };
+            var message = [0u8; 8192];
+            loop {
+                var source = [0u8; 12];
+                var sourceLength: u32 = 12;
+                let n = unsafe { recvfrom(
+                    target.fd,
+                    borrow mut message[0] as *mut u8,
+                    message.length,
+                    MSG_DONTWAIT,
+                    borrow mut source[0] as *mut u8,
+                    borrow mut sourceLength as *mut u32,
+                ) };
+                if (n < 0) {
+                    return;
+                }
+                // Only udev's multicast group (not the kernel's raw events, nor anyone else).
+                if (source[..].readLE<u32>(8) != UDEV_GROUP) {
+                    continue;
+                }
+                match (parseUevent(message[0..(truncate<usize>(n))])) {
+                    Some(event) => {
+                        let _ = sink.channel.trySend(event);
+                    }
+                    null => {}
+                }
+            }
+        }
+    }
+}
+
+const UDEV_MAGIC: [u8; 12] = ['l', 'i', 'b', 'u', 'd', 'e', 'v', 0, 0xfe, 0xed, 0xca, 0xfe];
+
+/// A udev monitor message as a hotplug event, if it is a USB device's add or remove.
+fn parseUevent(m: Slice<u8>) -> HotplugEvent? {
+    if (m.length < 24) {
+        return null;
+    }
+    let magic = UDEV_MAGIC;
+    if (m[0..12] != magic[..]) {
+        return null;
+    }
+    let offset = m.readLE<u32>(16) as usize;
+    let length = m.readLE<u32>(20) as usize;
+    if (offset > m.length || length > m.length - offset) {
+        return null;
+    }
+    var action: Slice<u8> = [];
+    var devpath: Slice<u8> = [];
+    var usb = false;
+    var device = false;
+    var busnum: u64 = 0;
+    var devnum: u64 = 0;
+    let nul = [0u8];
+    let equals = "=".bytes();
+    for (property in m[offset..offset + length].split(nul[..])) {
+        match (property.splitOnce(equals)) {
+            Some(kv) => {
+                let key = kv.left;
+                let value = kv.right;
+                if (key == "ACTION".bytes()) {
+                    action = value;
+                } else if (key == "DEVPATH".bytes()) {
+                    devpath = value;
+                } else if (key == "SUBSYSTEM".bytes()) {
+                    usb = value == "usb".bytes();
+                } else if (key == "DEVTYPE".bytes()) {
+                    device = value == "usb_device".bytes();
+                } else if (key == "BUSNUM".bytes()) {
+                    busnum = value.parseInt<u64>() ?? 0;
+                } else if (key == "DEVNUM".bytes()) {
+                    devnum = value.parseInt<u64>() ?? 0;
+                }
+            }
+            null => {}
+        }
+    }
+    if (!usb || !device) {
+        return null;
+    }
+    if (action == "remove".bytes()) {
+        return Some(HotplugEvent.Left(DeviceId { value: ((busnum & 0xFF) << 8) | (devnum & 0xFF) }));
+    }
+    if (action == "add".bytes()) {
+        var path = String.create();
+        if (path.append("/sys").isErr()) {
+            return null;
+        }
+        let tail = StringView.fromUtf8(devpath)?;
+        if (!tail.startsWith("/") && path.append("/").isErr()) {
+            return null;
+        }
+        if (path.append(tail).isErr()) {
+            return null;
+        }
+        match (linuxProbe(path.view())) {
+            Ok(Some(info)) => {
+                return Some(HotplugEvent.Arrived(info));
+            }
+            _ => {
+                return null;
+            }
+        }
+    }
+    return null;
+}

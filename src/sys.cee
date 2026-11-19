@@ -1,0 +1,113 @@
+// C library calls every POSIX backend uses, and the native helpers of src/platform/native.c. Linux-only and
+// macOS-only calls are in their backends' files, each declared @cfg so other builds never see them.
+
+@header("usb_os.h")
+extern "C" {
+    @effects()
+    fn usb_errno() -> i32;
+
+    @cfg("USB_OS_POSIX")
+    fn open(path: *CChar, flags: i32, ...) -> i32;
+    @cfg("USB_OS_POSIX")
+    @effects()
+    fn close(fd: i32) -> i32;
+    @cfg("USB_OS_POSIX")
+    fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
+    @cfg("USB_OS_POSIX")
+    fn ioctl(fd: i32, request: CULong, ...) -> i32;
+    @cfg("USB_OS_POSIX")
+    @effects()
+    fn mmap(address: *mut void, length: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> *mut void;
+    @cfg("USB_OS_POSIX")
+    @effects()
+    fn munmap(address: *mut void, length: usize) -> i32;
+    @cfg("USB_OS_POSIX")
+    fn usleep(microseconds: u32) -> i32;
+    @cfg("USB_OS_POSIX")
+    fn pthread_create(
+        thread: *mut u64,
+        attributes: *void,
+        start: extern "C" fn(*mut void) -> *mut void,
+        argument: *mut void,
+    ) -> i32;
+    @cfg("USB_OS_POSIX")
+    fn pthread_detach(thread: u64) -> i32;
+    @cfg("USB_OS_POSIX")
+    @effects()
+    fn sched_yield() -> i32;
+
+    @cfg("USB_OS_WINDOWS")
+    @effects()
+    fn Sleep(milliseconds: u32);
+    @cfg("USB_OS_WINDOWS")
+    @effects()
+    fn GetLastError() -> u32;
+    @cfg("USB_OS_WINDOWS")
+    fn CreateThread(
+        attributes: *mut void,
+        stackSize: usize,
+        start: extern "C" fn(*mut void) -> u32,
+        parameter: *mut void,
+        flags: u32,
+        threadId: *mut u32,
+    ) -> *mut void;
+    @cfg("USB_OS_WINDOWS")
+    @effects()
+    fn CloseHandle(handle: *mut void) -> i32;
+}
+
+/// Sleeps this thread for `ms` milliseconds, for the rare waits that are not on a signal (draining an endpoint in
+/// its drop, which must not need an executor).
+/// Safety: plain C calls with values.
+fn sleepMs(ms: u32) {
+    if (cfg("USB_OS_WINDOWS")) {
+        unsafe { Sleep(ms); }
+    }
+    if (cfg("USB_OS_POSIX")) {
+        unsafe { usleep(ms * 1000); }
+    }
+}
+
+/// The calling thread's last OS error: errno, or GetLastError on Windows.
+/// Safety: reads a thread-local.
+fn lastError() -> i32 {
+    if (cfg("USB_OS_WINDOWS")) {
+        return truncate<i32>(unsafe { GetLastError() });
+    }
+    return unsafe { usb_errno() };
+}
+
+/// Starts a detached native thread running `start(argument)`: the event loops live for the process, and a
+/// CeeSafe `Thread` would be joined at exit. False if the thread could not be made.
+/// Safety: `argument` stays valid for the thread's life (callers pass null or a static).
+fn startThread(posix: extern "C" fn(*mut void) -> *mut void, windows: extern "C" fn(*mut void) -> u32) -> bool {
+    if (cfg("USB_OS_WINDOWS")) {
+        var id: u32 = 0;
+        let h = unsafe { CreateThread(0 as *mut void, 0, windows, 0 as *mut void, 0, borrow mut id as *mut u32) };
+        if (h.isNull()) {
+            return false;
+        }
+        unsafe { CloseHandle(h); }
+        return true;
+    }
+    if (cfg("USB_OS_POSIX")) {
+        var t: u64 = 0;
+        if (unsafe { pthread_create(borrow mut t as *mut u64, 0 as *void, posix, 0 as *mut void) } != 0) {
+            return false;
+        }
+        unsafe { pthread_detach(t); }
+        return true;
+    }
+    return false;
+}
+
+/// Gives up the rest of this thread's time slice.
+/// Safety: plain C calls.
+fn yieldThread() {
+    if (cfg("USB_OS_WINDOWS")) {
+        unsafe { Sleep(0); }
+    }
+    if (cfg("USB_OS_POSIX")) {
+        unsafe { sched_yield(); }
+    }
+}

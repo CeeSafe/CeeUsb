@@ -1,0 +1,91 @@
+// Hotplug: a Watcher receives HotplugEvents from the platform's notification source, through a channel the event
+// loop fills (Linux: udev netlink on the epoll thread; macOS: IOKit notifications on the run loop thread).
+
+const HOTPLUG_QUEUE: usize = 256;
+
+/// Watches for devices arriving and leaving until dropped. Events that arrive while the queue (256 events) is
+/// full are dropped: list the devices again if that matters.
+public struct Watcher {
+    channel: Channel<HotplugEvent>;
+    linuxSink: Box<HotplugSink>?;
+    linuxTarget: Box<EventTarget>?;
+    mac: Box<MacWatch>?;
+    win: Box<WinWatch>?;
+
+    fn create() -> Result<Watcher, UsbError> {
+        let channel = match (Channel<HotplugEvent>.create(HOTPLUG_QUEUE)) {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(UsbError.noMemory(Operation.Hotplug));
+            }
+        };
+        var w = Watcher { channel: channel.clone(), linuxSink: null, linuxTarget: null, mac: null, win: null };
+        if (cfg("USB_OS_LINUX")) {
+            let sink = match (Box.create(HotplugSink { channel: channel.clone() })) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(UsbError.noMemory(Operation.Hotplug));
+                }
+            };
+            let s: borrow HotplugSink = borrow sink;
+            let target = linuxHotplugOpen(s as *HotplugSink as *void)?;
+            w.linuxSink = Some(sink);
+            w.linuxTarget = Some(target);
+        }
+        if (cfg("USB_OS_MACOS")) {
+            var watch = match (Box.create(
+                MacWatch { channel: channel.clone(), port: 0 as *void, arrived: 0, left: 0 },
+            )) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(UsbError.noMemory(Operation.Hotplug));
+                }
+            };
+            macWatch(mut watch)?;
+            w.mac = Some(watch);
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            var watch = match (Box.create(WinWatch { channel: channel.clone(), handle: 0 as *mut void })) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(UsbError.noMemory(Operation.Hotplug));
+                }
+            };
+            winWatch(mut watch)?;
+            w.win = Some(watch);
+        }
+        return Ok(w);
+    }
+
+    /// The next event, blocking; null once the watcher is closed.
+    public fn next(borrow this) -> HotplugEvent? => this.channel.recv();
+
+    /// The next event if one is queued.
+    public fn tryNext(borrow this) -> HotplugEvent? => this.channel.tryRecv();
+
+    /// The next event, waiting as a task; null once the watcher is closed.
+    public async fn nextAsync(borrow this) -> Result<HotplugEvent?, AsyncError> => await this.channel.recvAsync();
+
+    /// Safety: each platform source is removed (with its loop barrier) before what it points at is freed.
+    drop {
+        match (borrow this.linuxTarget) {
+            Some(t) => {
+                linuxHotplugClose(t);
+            }
+            null => {}
+        }
+        match (borrow mut this.mac) {
+            Some(m) => {
+                macUnwatch(m);
+            }
+            null => {}
+        }
+        match (borrow mut this.win) {
+            Some(m) => {
+                winUnwatch(m);
+            }
+            null => {}
+        }
+        this.channel.close();
+    }
+}

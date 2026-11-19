@@ -1,0 +1,243 @@
+// Captures one fingerprint frame from a ZKTeco Live20R / SLK20R (1B55:0120) with this library alone: no vendor SDK,
+// no libusb. A port of the C# FingerprintCapture sample, whose protocol was reverse engineered from a capture of
+// the vendor SDK and verified there on Linux and Windows hardware.
+//
+// NOT VERIFIED against the scanner: none was available while porting. It builds; the protocol, register values and
+// timing follow the C# sample. One change: the 120000-byte frame is read as eight 16 KiB transfers queued at once
+// (one transfer in flight per chunk, freshly allocated, in the C# version), into buffers reused across attempts.
+//
+// Protocol (vendor requests on the default control endpoint): 0xE0 OUT reset; 0x80 OUT 16 zeros, init (stalls;
+// ignored); 0xE1 OUT write a 16-bit register (value, register); 0xE3 OUT write an 8-bit register; 0xEA IN one byte,
+// the frame-ready flag. Then bulk IN 0x82 streams a 300x400 8-bit grayscale image, ended by a short packet.
+// The scan engine disarms itself shortly after arming, and a frame is exposed on the transition of a finger
+// touching the sensor: re-arm before every attempt and poll 0xEA quickly.
+// usage: fingerprint [output.bmp]
+
+const WIDTH: usize = 300;
+const HEIGHT: usize = 400;
+const IMAGE: usize = 120000;
+const BULK_IN: u8 = 0x82;
+const CHUNK: usize = 16384;
+const TIMEOUT: u32 = 2000;
+
+struct Scanner<region r> {
+    iface: borrow(r) usb.Interface;
+
+    /// A vendor request; stalls and timeouts on configuration writes are harmless (a control stall clears on the
+    /// next request), as in the C# sample.
+    fn out(borrow this, request: u8, value: u16, index: u16, data: Slice<u8>) {
+        let _ = this.iface.controlOut(
+            usb.ControlRequest.vendor(usb.Recipient.Device, request, value, index),
+            data,
+            TIMEOUT,
+        );
+    }
+
+    fn reg16(borrow this, register: u8, value: u16) {
+        let none: Slice<u8> = [];
+        this.out(0xE1, value, register as u16, none);
+    }
+
+    fn reg8(borrow this, register: u8, value: u8) {
+        let none: Slice<u8> = [];
+        this.out(0xE3, value as u16, register as u16, none);
+    }
+
+    fn ready(borrow this) -> bool {
+        var flag = [0u8; 1];
+        return match (this.iface.controlIn(
+            usb.ControlRequest.vendor(usb.Recipient.Device, 0xEA, 0, 0),
+            mut flag[..],
+            TIMEOUT,
+        )) {
+            Ok(1) => flag[0] != 0,
+            _ => false,
+        };
+    }
+
+    /// Reset, init block, analog gains, exposure and LED: the settings the vendor SDK converged on.
+    fn configure(borrow this) {
+        let none: Slice<u8> = [];
+        this.out(0xE0, 0, 0, none);
+        let zeros = [0u8; 16];
+        this.out(0x80, 0, 0, zeros[..]);
+        let gainRegs = [0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let gainValues = [0xC801u16, 0xC801, 0xAF01, 0xAF01, 0xA101, 0xA101];
+        for (i in 0..gainRegs.length) {
+            this.reg16(gainRegs[i], gainValues[i]);
+        }
+        let regs = [0xA5u8, 0xA6, 0xA3, 0xA4, 0xA9, 0xAA, 0xA7, 0xA8, 0x03, 0x04];
+        let values = [0xBFu8, 0xBF, 0xC8, 0xC8, 0xC8, 0xC8, 0x83, 0x83, 0x00, 0xA6];
+        for (i in 0..regs.length) {
+            this.reg8(regs[i], values[i]);
+        }
+    }
+
+    /// (Re)arms the scan engine; it must be re-sent before each attempt.
+    fn arm(borrow this) {
+        this.reg16(0x06, 0x8001);
+        this.reg16(0x07, 0x8001);
+        this.reg16(0x08, 0x8001);
+        this.reg16(0x53, 0x0001);
+        this.reg16(0x32, 0x0000);
+        this.reg16(0x31, 0x0001);
+        this.reg16(0x30, 0x0003);
+    }
+
+    fn stop(borrow this) {
+        this.reg16(0x30, 0x0000);
+        this.reg16(0x31, 0x0000);
+    }
+}
+
+/// Reads one frame: every chunk queued at once, taken in order until a short packet ends the frame; the rest are
+/// cancelled. The bytes copied into `image`; the buffers go back to `free`.
+fn readFrame(ep: borrow mut usb.Endpoint, image: SliceMut<u8>, free: borrow mut Vector<usb.Buffer>) -> usize {
+    var queued: usize = 0;
+    while (queued * CHUNK < IMAGE) {
+        var b = match (free.pop()) {
+            Some(b) => b,
+            null => ep.allocate(CHUNK).ok()!,
+        };
+        b.clear();
+        b.setRequested(CHUNK);
+        if (ep.submit(b).isErr()) {
+            break;
+        }
+        queued += 1;
+    }
+    var got: usize = 0;
+    var ended = false;
+    while (ep.pending() > 0) {
+        let c = match (ep.waitComplete(1500)) {
+            Some(c) => c,
+            null => {
+                ep.cancelAll();
+                ended = true;
+                continue;
+            }
+        };
+        if (!ended && c.isSuccess()) {
+            let n = if (c.actualLength < IMAGE - got) c.actualLength else IMAGE - got;
+            image[got..got + n].copyFrom(c.buffer.view()[0..n]);
+            got += n;
+            if (c.actualLength < CHUNK) {
+                ended = true;
+                ep.cancelAll();
+            }
+        } else if (!c.isSuccess() && !ended) {
+            ended = true;
+            ep.cancelAll();
+        }
+        let _ = free.push(c.buffer);
+    }
+    return got;
+}
+
+/// An 8-bit grayscale BMP, bottom-up.
+fn writeBmp(path: StringView, image: Slice<u8>) -> Result<void, IoError> {
+    let stride = (WIDTH + 3) & (0usize.wrappingSub(1) ^ 3);
+    let pixels: usize = 14 + 40 + 256 * 4;
+    var out = Vector<u8>.create();
+    let size = truncate<u32>(pixels + stride * HEIGHT);
+    out.pushLE(0x4D42u16)!;
+    out.pushLE(size)!;
+    out.pushLE(0u32)!;
+    out.pushLE(truncate<u32>(pixels))!;
+    out.pushLE(40u32)!;
+    out.pushLE(truncate<i32>(WIDTH))!;
+    out.pushLE(truncate<i32>(HEIGHT))!;
+    out.pushLE(1u16)!;
+    out.pushLE(8u16)!;
+    out.pushLE(0u32)!;
+    out.pushLE(truncate<u32>(stride * HEIGHT))!;
+    out.pushLE(2835u32)!;
+    out.pushLE(2835u32)!;
+    out.pushLE(256u32)!;
+    out.pushLE(0u32)!;
+    for (i in 0..256) {
+        let g = truncate<u8>(i);
+        out.push(g)!;
+        out.push(g)!;
+        out.push(g)!;
+        out.push(0)!;
+    }
+    var y = HEIGHT;
+    while (y > 0) {
+        y -= 1;
+        out.extend(image[y * WIDTH..(y + 1) * WIDTH])!;
+        for (pad in 0..(stride - WIDTH)) {
+            out.push(0)!;
+        }
+    }
+    var file = File.create(path)?;
+    file.write(out.view())?;
+    return Ok();
+}
+
+fn main() {
+    let selector = usb.DeviceSelector.ids(0x1B55, 0x0120);
+    let info = match (usb.Usb.findDevice(borrow selector)) {
+        Ok(Some(i)) => i,
+        _ => {
+            Console.writeErrorLine("scanner not found (is it bound to WinUSB / accessible?)");
+            Process.exit(1);
+        }
+    };
+    let device = usb.Usb.open(borrow info)!;
+    // macOS needs an explicit configuration for vendor-class devices.
+    if (device.activeConfiguration().isErr()) {
+        var configs = device.configurations();
+        match (configs.next()) {
+            Some(c) => {
+                let _ = device.setConfiguration(c.value());
+            }
+            null => {}
+        }
+    }
+    let iface = device.detachAndClaimInterface(0)!;
+    let scanner = Scanner { iface: borrow iface };
+    Console.writeLine("configuring the scanner...");
+    scanner.configure();
+    Console.writeLine("Touch and LIFT your finger on the scanner repeatedly; capturing (up to 45 s)...");
+    var ep = iface.openEndpointWith(BULK_IN, 8)!;
+    var image = Vector<u8>.create();
+    image.resize(IMAGE, 0)!;
+    var free = Vector<usb.Buffer>.create();
+    let deadline = Clock.monotonicNanos() + 45 * 1000000000;
+    var captured: usize = 0;
+    while (captured == 0 && Clock.monotonicNanos() < deadline) {
+        scanner.arm();
+        // Poll quickly (every ~40 ms, for ~2.5 s per arming) to catch the short frame-ready window of a touch.
+        for (i in 0..60) {
+            if (scanner.ready()) {
+                let got = readFrame(mut ep, image.viewMut(), mut free);
+                if (got >= IMAGE * 7 / 10) {
+                    captured = got;
+                }
+                break;
+            }
+            let _ = Async.run(Timer.sleep(40));
+        }
+    }
+    scanner.stop();
+    if (captured == 0) {
+        Console.writeErrorLine("no frame captured: touch and lift repeatedly; the frame is exposed on the touch.");
+        Process.exit(2);
+    }
+    Console.write("captured ");
+    Console.write(captured);
+    Console.writeLine(" bytes");
+    let path = Process.argument(1) ?? "fingerprint.bmp";
+    match (writeBmp(path, image.view())) {
+        Ok() => {
+            Console.write("saved ");
+            Console.writeLine(path);
+        }
+        Err(e) => {
+            Console.write("could not write the image: ");
+            Console.writeLine(e.message());
+            Process.exit(1);
+        }
+    }
+}

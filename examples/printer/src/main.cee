@@ -1,0 +1,191 @@
+// Hardware transfer test against a USB printer bound to WinUSB (or usbfs/IOKit): bulk OUT 0x03, bulk IN 0x81.
+// Sends nothing that prints: the printer-class GET_DEVICE_ID control request, ESC @ (initialise) and DLE EOT 1
+// (an ESC/POS status request, answered with one byte on bulk IN). Exercises: claim, interface control IN, bulk
+// OUT, bulk IN, timeouts with cancel, the ring with several transfers in flight and cancelAll, async reads.
+// usage: printer [vid] [pid]   (default 0483 5840)
+
+fn hex16(text: StringView) -> u16 => text.parseIntRadix<u16>(16) ?? 0;
+
+fn show(what: StringView, e: usb.UsbError) {
+    var line = [0u8; 256];
+    var w = TextWriter.create(mut line[..]);
+    w.text(what);
+    w.text(": ");
+    e.write(mut w);
+    Console.writeLine(StringView.fromUtf8(w.written()) ?? "?");
+}
+
+fn step(what: StringView, ok: bool) {
+    Console.write(if (ok) "PASS " else "FAIL ");
+    Console.writeLine(what);
+}
+
+async fn asyncRead(ep: borrow mut usb.Endpoint) -> Result<usize, usb.UsbError> {
+    var b = [0u8; 64];
+    return await Async.timeout(
+        300,
+        usb.UsbError.create(usb.ErrorKind.TimedOut, usb.Operation.Transfer, 0),
+        async () => await ep.readAsync(mut b[..]),
+    );
+}
+
+fn main() {
+    let vid = hex16(Process.argument(1) ?? "0483");
+    let pid = hex16(Process.argument(2) ?? "5840");
+    let selector = usb.DeviceSelector.ids(vid, pid);
+    let info = match (usb.Usb.findDevice(borrow selector)) {
+        Ok(Some(i)) => i,
+        _ => {
+            Console.writeLine("FAIL device not found");
+            Process.exit(1);
+        }
+    };
+    let device = match (usb.Usb.open(borrow info)) {
+        Ok(d) => d,
+        Err(e) => {
+            show("FAIL open", e);
+            Process.exit(1);
+        }
+    };
+    let iface = match (device.detachAndClaimInterface(0)) {
+        Ok(i) => i,
+        Err(e) => {
+            show("FAIL claim interface 0", e);
+            Process.exit(1);
+        }
+    };
+    step("claim interface 0", true);
+
+    // A standard request through the claimed interface (on Windows, WinUSB's control pipe): the device
+    // descriptor, which must match the one enumeration cached.
+    var raw = [0u8; 18];
+    match (iface.controlIn(usb.getDescriptorRequest(usb.DESCRIPTOR_DEVICE, 0, 0), mut raw[..], 1000)) {
+        Ok(n) => {
+            step(
+                "control IN GET_DESCRIPTOR(device) through the interface matches the cache",
+                n == 18 && raw[..] == device.descriptor().bytes[..],
+            );
+        }
+        Err(e) => { show("FAIL control IN GET_DESCRIPTOR(device)", e); }
+    }
+
+    // Printer class GET_DEVICE_ID: IN, class, interface; wIndex = interface 0, alt 0. Optional for a printer.
+    var id = [0u8; 1024];
+    match (iface.controlIn(
+        usb.ControlRequest.create(usb.ControlType.Class, usb.Recipient.Interface, 0, 0, 0),
+        mut id[..],
+        1000,
+    )) {
+        Ok(n) => {
+            Console.write("     GET_DEVICE_ID: ");
+            Console.write(n);
+            Console.writeLine(" bytes");
+            if (n > 2) {
+                Console.write("     device ID: ");
+                Console.writeLine(StringView.fromUtf8(id[2..n]) ?? "(not UTF-8)");
+            }
+        }
+        Err(e) => { show("INFO GET_DEVICE_ID", e); }
+    }
+
+    var out = match (iface.openEndpoint(0x03)) {
+        Ok(e) => e,
+        Err(e) => {
+            show("FAIL open bulk OUT 0x03", e);
+            Process.exit(1);
+        }
+    };
+    var input = match (iface.openEndpoint(0x81)) {
+        Ok(e) => e,
+        Err(e) => {
+            show("FAIL open bulk IN 0x81", e);
+            Process.exit(1);
+        }
+    };
+    step("open bulk endpoints 0x03 and 0x81", true);
+
+    // An IN read that nothing answers must time out, and its transfer must come back cancelled.
+    var buffer = [0u8; 64];
+    let t0 = Clock.monotonicNanos();
+    match (input.read(mut buffer[..], 200)) {
+        Ok(n) => {
+            Console.write("     (unsolicited IN data: ");
+            Console.write(n);
+            Console.writeLine(" bytes)");
+        }
+        Err(e) => {
+            let ms = (Clock.monotonicNanos() - t0) / 1000000;
+            step("bulk IN read times out and is cancelled", e.kind is usb.ErrorKind.TimedOut && ms >= 190 && ms < 1500);
+        }
+    }
+    step("nothing left pending after the timeout", input.pending() == 0);
+
+    let init = [0x1Bu8, 0x40];
+    match (out.write(init[..], 1000)) {
+        Ok() => { step("bulk OUT ESC @", true); }
+        Err(e) => { show("FAIL bulk OUT ESC @", e); }
+    }
+    let status = [0x10u8, 0x04, 0x01];
+    let t1 = Clock.monotonicNanos();
+    match (out.write(status[..], 1000)) {
+        Ok() => {
+            match (input.read(mut buffer[..], 1000)) {
+                Ok(n) => {
+                    Console.write("     status byte(s): ");
+                    Console.write(n);
+                    Console.write(", first 0x");
+                    Console.write(buffer[0]);
+                    Console.write(", round trip ");
+                    Console.write((Clock.monotonicNanos() - t1) / 1000);
+                    Console.writeLine(" us");
+                    step("bulk OUT DLE EOT 1 then bulk IN status", n >= 1);
+                }
+                Err(e) => { show("INFO no ESC/POS status answer (the printer may not speak ESC/POS)", e); }
+            }
+        }
+        Err(e) => { show("FAIL bulk OUT DLE EOT", e); }
+    }
+
+    // The ring: four IN transfers in flight, cancelled together, come back in order, all accounted for.
+    for (i in 0..4) {
+        var b = input.allocate(64).ok()!;
+        b.setRequested(64);
+        let _ = input.submit(b);
+    }
+    step("four IN transfers in flight", input.pending() == 4);
+    input.cancelAll();
+    var back: u32 = 0;
+    var cancelled: u32 = 0;
+    while (input.pending() > 0) {
+        match (input.waitComplete(2000)) {
+            Some(c) => {
+                back += 1;
+                if (c.status is usb.TransferStatus.Cancelled) {
+                    cancelled += 1;
+                }
+            }
+            null => { break; }
+        }
+    }
+    step("cancelAll returns every transfer, cancelled", back == 4 && cancelled == 4);
+
+    // Async: a read raced against a deadline is cancelled and gives its buffer back.
+    match (Async.run(asyncRead(mut input))) {
+        Ok(n) => {
+            Console.write("     (async read got ");
+            Console.write(n);
+            Console.writeLine(" bytes)");
+        }
+        Err(e) => {
+            step(
+                "async read cancelled by its deadline",
+                (e.kind is usb.ErrorKind.TimedOut || e.kind is usb.ErrorKind.Cancelled) && input.pending() == 0,
+            );
+        }
+    }
+    match (input.clearHalt()) {
+        Ok() => { step("clear halt", true); }
+        Err(e) => { show("FAIL clear halt", e); }
+    }
+    Console.writeLine("done");
+}

@@ -1,0 +1,121 @@
+// Opens a device by VID:PID (hex) and reads it: descriptors from the OS cache, strings and the device descriptor
+// over control transfers, and a claim of each interface (without detaching drivers).
+// usage: info <vid> <pid>
+
+fn report(what: StringView, e: usb.UsbError) {
+    var line = [0u8; 256];
+    var w = TextWriter.create(mut line[..]);
+    w.text(what);
+    w.text(": ");
+    e.write(mut w);
+    Console.writeLine(StringView.fromUtf8(w.written()) ?? "?");
+}
+
+fn hex16(text: StringView) -> u16 => text.parseIntRadix<u16>(16) ?? 0;
+
+fn main() {
+    let vid = hex16(Process.argument(1) ?? "0");
+    let pid = hex16(Process.argument(2) ?? "0");
+    let selector = usb.DeviceSelector.ids(vid, pid);
+    let info = match (usb.Usb.findDevice(borrow selector)) {
+        Ok(Some(i)) => i,
+        Ok(null) => {
+            Console.writeLine("no such device");
+            Process.exit(1);
+        }
+        Err(e) => {
+            report("enumerate", e);
+            Process.exit(1);
+        }
+    };
+    let t0 = Clock.monotonicNanos();
+    let device = match (usb.Usb.open(borrow info)) {
+        Ok(d) => d,
+        Err(e) => {
+            report("open", e);
+            Process.exit(1);
+        }
+    };
+    Console.write("opened in ");
+    Console.write((Clock.monotonicNanos() - t0) / 1000);
+    Console.writeLine(" us");
+    let d = device.descriptor();
+    Console.write("cached descriptor: vid ");
+    Console.write(d.vendorId());
+    Console.write(" pid ");
+    Console.write(d.productId());
+    Console.write(" configurations ");
+    Console.writeLine(d.configurationCount());
+
+    // The device descriptor again, over the wire.
+    var raw = [0u8; 18];
+    let t1 = Clock.monotonicNanos();
+    match (device.getDescriptor(usb.DESCRIPTOR_DEVICE, 0, 0, mut raw[..], 1000)) {
+        Ok(n) => {
+            Console.write("GET_DESCRIPTOR(device): ");
+            Console.write(n);
+            Console.write(" bytes in ");
+            Console.write((Clock.monotonicNanos() - t1) / 1000);
+            Console.write(" us, matches cache: ");
+            Console.writeLine(raw[..] == d.bytes[..]);
+        }
+        Err(e) => { report("GET_DESCRIPTOR", e); }
+    }
+    match (device.stringLanguages(1000)) {
+        Ok(langs) => {
+            Console.write("languages: ");
+            Console.writeLine(langs.length);
+            if (langs.length > 0) {
+                let lang = langs[0];
+                if (d.manufacturerIndex() != 0) {
+                    match (device.getString(d.manufacturerIndex(), lang, 1000)) {
+                        Ok(s) => {
+                            Console.write("manufacturer: ");
+                            Console.writeLine(s.view());
+                        }
+                        Err(e) => { report("manufacturer", e); }
+                    }
+                }
+                if (d.productIndex() != 0) {
+                    match (device.getString(d.productIndex(), lang, 1000)) {
+                        Ok(s) => {
+                            Console.write("product: ");
+                            Console.writeLine(s.view());
+                        }
+                        Err(e) => { report("product", e); }
+                    }
+                }
+            }
+        }
+        Err(e) => { report("languages", e); }
+    }
+    Console.write("active configuration: ");
+    Console.writeLine(device.activeConfigurationValue());
+    match (device.activeConfiguration()) {
+        Ok(c) => {
+            var groups = c.interfaces();
+            for (g in groups) {
+                let alt = g.first();
+                Console.write("interface ");
+                Console.write(g.number);
+                Console.write(" class ");
+                Console.write(alt.interfaceClass());
+                var eps = alt.endpoints();
+                for (e in eps) {
+                    Console.write(" ep ");
+                    Console.write(e.address());
+                    Console.write("/");
+                    Console.write(e.maxPacketSize());
+                }
+                Console.writeLine("");
+                match (device.claimInterface(g.number)) {
+                    Ok(iface) => {
+                        Console.writeLine("  claimed");
+                    }
+                    Err(e) => { report("  claim", e); }
+                }
+            }
+        }
+        Err(e) => { report("active configuration", e); }
+    }
+}

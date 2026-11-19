@@ -1,0 +1,481 @@
+// Descriptor parsing, zero-copy: every type here is a view over the bytes the OS gave (usbfs's descriptor file,
+// IOKit's cached configuration, WinUSB's), and walking them allocates nothing. The C# version allocated an
+// enumerator and grouping lists per walk (3.4 KB for a 14-alt-setting device); here a walk is a loop over a slice.
+
+public const DESCRIPTOR_DEVICE: u8 = 0x01;
+public const DESCRIPTOR_CONFIGURATION: u8 = 0x02;
+public const DESCRIPTOR_STRING: u8 = 0x03;
+public const DESCRIPTOR_INTERFACE: u8 = 0x04;
+public const DESCRIPTOR_ENDPOINT: u8 = 0x05;
+
+/// US English, the language most devices have.
+public const LANGUAGE_US_ENGLISH: u16 = 0x0409;
+
+const DEVICE_LENGTH: usize = 18;
+const CONFIGURATION_HEADER: usize = 9;
+const INTERFACE_MIN: usize = 9;
+const ENDPOINT_MIN: usize = 7;
+
+/// The 18-byte device descriptor, copied (it is small, and outlives the blob it came from).
+public struct DeviceDescriptor {
+    public bytes: [u8; 18];
+
+    /// Checks the length and type, or null.
+    public fn parse(data: Slice<u8>) -> DeviceDescriptor? {
+        if (data.length < DEVICE_LENGTH || (data[0] as usize) < DEVICE_LENGTH || data[1] != DESCRIPTOR_DEVICE) {
+            return null;
+        }
+        var bytes = [0u8; 18];
+        bytes[..].copyFrom(data[0..DEVICE_LENGTH]);
+        return Some(DeviceDescriptor { bytes: bytes });
+    }
+
+    /// Made from fields, for platforms that cache them rather than the descriptor (macOS's registry).
+    public fn fromFields(
+        usbVersion: u16,
+        deviceClass: u8,
+        deviceSubclass: u8,
+        deviceProtocol: u8,
+        maxPacketSize0: u8,
+        vendorId: u16,
+        productId: u16,
+        deviceVersion: u16,
+        manufacturerIndex: u8,
+        productIndex: u8,
+        serialIndex: u8,
+        configurations: u8,
+    ) -> DeviceDescriptor {
+        var b = [0u8; 18];
+        b[0] = 18;
+        b[1] = DESCRIPTOR_DEVICE;
+        b[..].writeLE(2, usbVersion);
+        b[4] = deviceClass;
+        b[5] = deviceSubclass;
+        b[6] = deviceProtocol;
+        b[7] = maxPacketSize0;
+        b[..].writeLE(8, vendorId);
+        b[..].writeLE(10, productId);
+        b[..].writeLE(12, deviceVersion);
+        b[14] = manufacturerIndex;
+        b[15] = productIndex;
+        b[16] = serialIndex;
+        b[17] = configurations;
+        return DeviceDescriptor { bytes: b };
+    }
+
+    public fn usbVersion(borrow this) -> u16 => this.bytes[..].readLE<u16>(2);
+    public fn deviceClass(borrow this) -> u8 => this.bytes[4];
+    public fn deviceSubclass(borrow this) -> u8 => this.bytes[5];
+    public fn deviceProtocol(borrow this) -> u8 => this.bytes[6];
+    public fn maxPacketSize0(borrow this) -> u8 => this.bytes[7];
+    public fn vendorId(borrow this) -> u16 => this.bytes[..].readLE<u16>(8);
+    public fn productId(borrow this) -> u16 => this.bytes[..].readLE<u16>(10);
+    public fn deviceVersion(borrow this) -> u16 => this.bytes[..].readLE<u16>(12);
+    /// 0 when the device has no such string.
+    public fn manufacturerIndex(borrow this) -> u8 => this.bytes[14];
+    public fn productIndex(borrow this) -> u8 => this.bytes[15];
+    public fn serialIndex(borrow this) -> u8 => this.bytes[16];
+    public fn configurationCount(borrow this) -> u8 => this.bytes[17];
+}
+
+/// Any descriptor: `bytes[0]` is its length, `bytes[1]` its type.
+public struct Descriptor<region r> {
+    public bytes: Slice<r, u8>;
+
+    public fn descriptorType(borrow this) -> u8 => this.bytes[1];
+}
+
+/// Walks a run of descriptors, stopping at the first malformed one (a length below 2 or past the end).
+public struct DescriptorIter<region r> {
+    bytes: Slice<r, u8>;
+    at: usize;
+
+    public fn over(bytes: Slice<r, u8>) -> DescriptorIter<r> => DescriptorIter { bytes: bytes, at: 0 };
+
+    public fn next(borrow mut this) -> Descriptor<r>? {
+        let bytes = this.bytes;
+        let at = this.at;
+        if (at + 2 > bytes.length) {
+            return null;
+        }
+        let n = bytes[at] as usize;
+        if (n < 2 || at + n > bytes.length) {
+            this.at = bytes.length;
+            return null;
+        }
+        this.at = at + n;
+        return Some(Descriptor { bytes: bytes[at..at + n] });
+    }
+}
+
+/// The end of a group that starts at `bytes[0]`: it runs over the following descriptors until the next one of
+/// `kind`, a malformed one (length ≤ 2) or the end, as nusb and the C# version group them.
+fn groupEnd(bytes: Slice<u8>, kind: u8) -> usize {
+    var end = bytes[0] as usize;
+    while (bytes.length >= end + 2 && bytes[end] > 2 && bytes[end + 1] != kind &&
+        bytes.length >= end + (bytes[end] as usize)) {
+        end += bytes[end] as usize;
+    }
+    return end;
+}
+
+/// Splits a run of descriptors into groups that start with a descriptor of `kind` at least `minimum` long, each
+/// with the descriptors that follow it. Shorter descriptors of `kind` and anything before the first are skipped.
+struct GroupIter<region r> {
+    bytes: Slice<r, u8>;
+    at: usize;
+    kind: u8;
+    minimum: usize;
+
+    fn create(bytes: Slice<r, u8>, kind: u8, minimum: usize) -> GroupIter<r> =>
+        GroupIter { bytes: bytes, at: 0, kind: kind, minimum: minimum };
+
+    fn next(borrow mut this) -> Slice<r, u8>? {
+        let bytes = this.bytes;
+        loop {
+            let at = this.at;
+            if (at + 2 > bytes.length) {
+                return null;
+            }
+            let n = bytes[at] as usize;
+            if (n < 2 || at + n > bytes.length) {
+                this.at = bytes.length;
+                return null;
+            }
+            if (bytes[at + 1] == this.kind && n >= this.minimum) {
+                let end = at + groupEnd(bytes[at..], this.kind);
+                this.at = end;
+                return Some(bytes[at..end]);
+            }
+            this.at = at + n;
+        }
+    }
+}
+
+/// A configuration descriptor with everything under it (`wTotalLength` bytes).
+public struct ConfigurationDescriptor<region r> {
+    public bytes: Slice<r, u8>;
+
+    /// The first configuration in `data`, checked: its header, type and total length. Null if malformed.
+    public fn parse(data: Slice<r, u8>) -> ConfigurationDescriptor<r>? {
+        if (data.length < CONFIGURATION_HEADER || (data[0] as usize) < CONFIGURATION_HEADER) {
+            return null;
+        }
+        if (data[1] != DESCRIPTOR_CONFIGURATION) {
+            return null;
+        }
+        let total = data.readLE<u16>(2) as usize;
+        if (total < (data[0] as usize) || total > data.length) {
+            return null;
+        }
+        return Some(ConfigurationDescriptor { bytes: data[0..total] });
+    }
+
+    public fn interfaceCount(borrow this) -> u8 => this.bytes[4];
+    /// `bConfigurationValue`, the value SET_CONFIGURATION takes.
+    public fn value(borrow this) -> u8 => this.bytes[5];
+    /// 0 when there is no string.
+    public fn stringIndex(borrow this) -> u8 => this.bytes[6];
+    public fn attributes(borrow this) -> u8 => this.bytes[7];
+    /// In units of 2 mA (8 mA for SuperSpeed).
+    public fn maxPower(borrow this) -> u8 => this.bytes[8];
+
+    /// Every descriptor after the header.
+    public fn descriptors(borrow this) -> DescriptorIter<r> => DescriptorIter.over(this.body());
+
+    /// Every interface descriptor (one per alternate setting), with the endpoint and class descriptors under it.
+    public fn altSettings(borrow this) -> InterfaceIter<r> =>
+        InterfaceIter { groups: GroupIter.create(this.body(), DESCRIPTOR_INTERFACE, INTERFACE_MIN) };
+
+    /// Each interface once, in order of its number, with its alternate settings.
+    public fn interfaces(borrow this) -> InterfaceGroupIter<r> =>
+        InterfaceGroupIter { body: this.body(), last: -1 };
+
+    /// Every alternate setting of interface `number`, in the order the configuration lists them.
+    public fn altSettingsOf(borrow this, number: u8) -> InterfaceFilterIter<r> {
+        let body = this.body();
+        return InterfaceFilterIter {
+            inner: InterfaceIter { groups: GroupIter.create(body, DESCRIPTOR_INTERFACE, INTERFACE_MIN) },
+            number: number,
+        };
+    }
+
+    /// The alternate setting `alt` of interface `number`, or null.
+    public fn findAltSetting(borrow this, number: u8, alt: u8) -> InterfaceDescriptor<r>? {
+        var it = this.altSettings();
+        for (d in it) {
+            if (d.number() == number && d.altSetting() == alt) {
+                return Some(d);
+            }
+        }
+        return null;
+    }
+
+    fn body(borrow this) -> Slice<r, u8> {
+        let b = this.bytes;
+        let header = b[0] as usize;
+        return if (header >= b.length) b[b.length..] else b[header..];
+    }
+}
+
+/// Walks the configurations of a blob that holds several back to back (usbfs's descriptor file after the device
+/// descriptor), stopping at the first malformed one.
+public struct ConfigurationIter<region r> {
+    bytes: Slice<r, u8>;
+    at: usize;
+
+    public fn over(bytes: Slice<r, u8>) -> ConfigurationIter<r> => ConfigurationIter { bytes: bytes, at: 0 };
+
+    public fn next(borrow mut this) -> ConfigurationDescriptor<r>? {
+        let bytes = this.bytes;
+        let at = this.at;
+        match (ConfigurationDescriptor.parse(bytes[at..])) {
+            Some(c) => {
+                this.at = at + c.bytes.length;
+                return Some(c);
+            }
+            null => {
+                return null;
+            }
+        }
+    }
+}
+
+/// The interfaces of a configuration, by number. Finding the next number rescans the configuration, which is a
+/// few dozen bytes: no allocation and no sort, as against the C# version's SortedDictionary of lists.
+public struct InterfaceGroupIter<region r> {
+    body: Slice<r, u8>;
+    last: i32;
+
+    public fn next(borrow mut this) -> InterfaceGroup<r>? {
+        var best: i32 = 256;
+        var it = InterfaceIter { groups: GroupIter.create(this.body, DESCRIPTOR_INTERFACE, INTERFACE_MIN) };
+        for (d in it) {
+            let n = d.number() as i32;
+            if (n > this.last && n < best) {
+                best = n;
+            }
+        }
+        if (best == 256) {
+            return null;
+        }
+        this.last = best;
+        return Some(InterfaceGroup { number: truncate<u8>(best), body: this.body });
+    }
+}
+
+/// One interface of a configuration: its number and its alternate settings.
+public struct InterfaceGroup<region r> {
+    public number: u8;
+    body: Slice<r, u8>;
+
+    /// The alternate settings, in the order the configuration lists them.
+    public fn altSettings(borrow this) -> InterfaceFilterIter<r> {
+        let body = this.body;
+        let number = this.number;
+        return InterfaceFilterIter {
+            inner: InterfaceIter { groups: GroupIter.create(body, DESCRIPTOR_INTERFACE, INTERFACE_MIN) },
+            number: number,
+        };
+    }
+
+    /// The first alternate setting.
+    public fn first(borrow this) -> InterfaceDescriptor<r> {
+        var it = this.altSettings();
+        return it.next()!;
+    }
+}
+
+/// The alternate settings of one interface number.
+public struct InterfaceFilterIter<region r> {
+    inner: InterfaceIter<r>;
+    number: u8;
+
+    public fn next(borrow mut this) -> InterfaceDescriptor<r>? {
+        loop {
+            match (this.inner.next()) {
+                Some(d) => {
+                    if (d.number() == this.number) {
+                        return Some(d);
+                    }
+                }
+                null => {
+                    return null;
+                }
+            }
+        }
+    }
+}
+
+/// Walks the interface descriptors of a configuration.
+public struct InterfaceIter<region r> {
+    groups: GroupIter<r>;
+
+    public fn next(borrow mut this) -> InterfaceDescriptor<r>? {
+        match (this.groups.next()) {
+            Some(g) => {
+                return Some(InterfaceDescriptor { bytes: g });
+            }
+            null => {
+                return null;
+            }
+        }
+    }
+}
+
+/// One alternate setting of an interface, with the descriptors under it.
+public struct InterfaceDescriptor<region r> {
+    public bytes: Slice<r, u8>;
+
+    public fn number(borrow this) -> u8 => this.bytes[2];
+    public fn altSetting(borrow this) -> u8 => this.bytes[3];
+    public fn endpointCount(borrow this) -> u8 => this.bytes[4];
+    public fn interfaceClass(borrow this) -> u8 => this.bytes[5];
+    public fn interfaceSubclass(borrow this) -> u8 => this.bytes[6];
+    public fn interfaceProtocol(borrow this) -> u8 => this.bytes[7];
+    /// 0 when there is no string.
+    public fn stringIndex(borrow this) -> u8 => this.bytes[8];
+
+    /// The class-specific and endpoint descriptors after the interface descriptor.
+    public fn descriptors(borrow this) -> DescriptorIter<r> => DescriptorIter.over(this.body());
+
+    public fn endpoints(borrow this) -> EndpointIter<r> =>
+        EndpointIter { groups: GroupIter.create(this.body(), DESCRIPTOR_ENDPOINT, ENDPOINT_MIN) };
+
+    /// The endpoint with this address, or null.
+    public fn findEndpoint(borrow this, address: u8) -> EndpointDescriptor<r>? {
+        var it = this.endpoints();
+        for (e in it) {
+            if (e.address() == address) {
+                return Some(e);
+            }
+        }
+        return null;
+    }
+
+    fn body(borrow this) -> Slice<r, u8> {
+        let b = this.bytes;
+        let header = b[0] as usize;
+        return if (header >= b.length) b[b.length..] else b[header..];
+    }
+}
+
+/// Walks the endpoint descriptors of an alternate setting.
+public struct EndpointIter<region r> {
+    groups: GroupIter<r>;
+
+    public fn next(borrow mut this) -> EndpointDescriptor<r>? {
+        match (this.groups.next()) {
+            Some(g) => {
+                return Some(EndpointDescriptor { bytes: g });
+            }
+            null => {
+                return null;
+            }
+        }
+    }
+}
+
+/// An endpoint descriptor, with any companion descriptors after it.
+public struct EndpointDescriptor<region r> {
+    public bytes: Slice<r, u8>;
+
+    public fn address(borrow this) -> u8 => this.bytes[2];
+    public fn attributes(borrow this) -> u8 => this.bytes[3];
+    public fn direction(borrow this) -> Direction => directionOf(this.bytes[2]);
+    public fn transferType(borrow this) -> TransferType => transferTypeOf(this.bytes[3]);
+    /// `wMaxPacketSize` as written, with the high-bandwidth bits.
+    public fn maxPacketSizeRaw(borrow this) -> u16 => this.bytes.readLE<u16>(4);
+    /// The packet size in bytes (bits 0-10).
+    public fn maxPacketSize(borrow this) -> usize => (this.maxPacketSizeRaw() & 0x7FF) as usize;
+    /// Transactions per microframe for high-bandwidth endpoints (bits 11-12, plus one).
+    public fn packetsPerMicroframe(borrow this) -> u32 => (((this.maxPacketSizeRaw() >> 11) & 3) as u32) + 1;
+    public fn interval(borrow this) -> u8 => this.bytes[6];
+
+    /// The companion descriptors after the endpoint descriptor.
+    public fn descriptors(borrow this) -> DescriptorIter<r> {
+        let b = this.bytes;
+        let header = b[0] as usize;
+        return DescriptorIter.over(if (header >= b.length) b[b.length..] else b[header..]);
+    }
+}
+
+/// Is this a well-formed string descriptor (its length is the whole slice, its type STRING)?
+public fn isStringDescriptor(d: Slice<u8>) -> bool =>
+    d.length >= 2 && (d[0] as usize) == d.length && d[1] == DESCRIPTOR_STRING;
+
+/// Decodes a string descriptor's UTF-16LE text into `out` as UTF-8; an unpaired surrogate becomes U+FFFD. False
+/// (and nothing written) if the descriptor is malformed.
+public fn decodeStringDescriptor(d: Slice<u8>, out: borrow mut String) -> Result<bool, AllocError> {
+    if (!isStringDescriptor(d)) {
+        return Ok(false);
+    }
+    appendUtf16(d[2..], out)?;
+    return Ok(true);
+}
+
+/// Appends UTF-16LE text (an odd last byte ignored) to `out` as UTF-8; an unpaired surrogate becomes U+FFFD.
+fn appendUtf16(d: Slice<u8>, out: borrow mut String) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i + 1 < d.length) {
+        let unit = d.readLE<u16>(i) as u32;
+        i += 2;
+        var cp: u32 = unit;
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            if (i + 1 < d.length) {
+                let low = d.readLE<u16>(i) as u32;
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    i += 2;
+                    cp = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                } else {
+                    cp = 0xFFFD;
+                }
+            } else {
+                cp = 0xFFFD;
+            }
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            cp = 0xFFFD;
+        }
+        pushUtf8(out, cp)?;
+    }
+    return Ok();
+}
+
+/// The language IDs of string descriptor 0, into `out`. False if malformed.
+public fn decodeLanguageIds(d: Slice<u8>, out: borrow mut Vector<u16>) -> Result<bool, AllocError> {
+    if (!isStringDescriptor(d)) {
+        return Ok(false);
+    }
+    var i: usize = 2;
+    while (i + 1 < d.length) {
+        out.push(d.readLE<u16>(i))?;
+        i += 2;
+    }
+    return Ok(true);
+}
+
+fn pushUtf8(out: borrow mut String, cp: u32) -> Result<void, AllocError> {
+    var b = [0u8; 4];
+    var n: usize = 0;
+    if (cp < 0x80) {
+        b[0] = truncate<u8>(cp);
+        n = 1;
+    } else if (cp < 0x800) {
+        b[0] = truncate<u8>(0xC0 | (cp >> 6));
+        b[1] = truncate<u8>(0x80 | (cp & 0x3F));
+        n = 2;
+    } else if (cp < 0x10000) {
+        b[0] = truncate<u8>(0xE0 | (cp >> 12));
+        b[1] = truncate<u8>(0x80 | ((cp >> 6) & 0x3F));
+        b[2] = truncate<u8>(0x80 | (cp & 0x3F));
+        n = 3;
+    } else {
+        b[0] = truncate<u8>(0xF0 | (cp >> 18));
+        b[1] = truncate<u8>(0x80 | ((cp >> 12) & 0x3F));
+        b[2] = truncate<u8>(0x80 | ((cp >> 6) & 0x3F));
+        b[3] = truncate<u8>(0x80 | (cp & 0x3F));
+        n = 4;
+    }
+    out.append(StringView.fromUtf8(b[0..n])!)?;
+    return Ok();
+}

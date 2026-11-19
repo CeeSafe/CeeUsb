@@ -1,0 +1,106 @@
+// Reads interrupt reports and prints them in hex (the C# UsbInterruptTransfer sample), as a task: Ctrl+C stops it
+// cleanly, cancelling the read in flight. With an OUT endpoint, first sends one 64-byte report of 0xA5 to it.
+// usage: interrupt <vid:pid> <interface> <in-ep hex> [count] [out-ep hex]
+
+enum Stop {
+    Usb(usb.UsbError),
+    Async(AsyncError),
+}
+
+fn hexDigit(n: u8) -> u8 => if (n < 10) '0' + n else 'A' + n - 10;
+
+async fn readReports(ep: borrow mut usb.Endpoint, count: u64) -> Result<bool, Stop> {
+    var buffer = [0u8; 1024];
+    let want = if (ep.maxPacketSize() < buffer.length) ep.maxPacketSize() else buffer.length;
+    var seen: u64 = 0;
+    while (count == 0 || seen < count) {
+        let n = match (await ep.readAsync(mut buffer[0..want])) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(Stop.Usb(e));
+            }
+        };
+        if (n == 0) {
+            // A zero-length packet ends a report that filled whole packets: not a report of its own.
+            continue;
+        }
+        var line = [0u8; 2048];
+        for (i in 0..n) {
+            line[i * 2] = hexDigit(buffer[i] >> 4);
+            line[i * 2 + 1] = hexDigit(buffer[i] & 15);
+        }
+        match (await AsyncConsole.writeLine(StringView.fromUtf8(line[0..n * 2]) ?? "")) {
+            Ok() => {}
+            Err(e) => {
+                return Err(Stop.Async(e));
+            }
+        }
+        seen += 1;
+    }
+    return Ok(true);
+}
+
+async fn interrupted(signals: borrow ProcessSignals) -> Result<bool, Stop> {
+    match (await signals.waitAsync()) {
+        Ok(_) => {
+            return Ok(false);
+        }
+        Err(e) => {
+            return Err(Stop.Async(e));
+        }
+    }
+}
+
+async fn run(ep: borrow mut usb.Endpoint, count: u64, signals: borrow ProcessSignals) -> Result<bool, Stop> {
+    let raced = await Async.race(async () => await readReports(ep, count), async () => await interrupted(signals))?;
+    return Ok(raced.value);
+}
+
+fn main() {
+    let ids = Process.argument(1) ?? "";
+    let halves = match (ids.splitOnce(":")) {
+        Some(h) => h,
+        null => {
+            Console.writeErrorLine("usage: interrupt <vid:pid> <interface> <in-ep hex> [count] [out-ep hex]");
+            Process.exit(1);
+        }
+    };
+    let vid = halves.left.parseIntRadix<u16>(16) ?? 0;
+    let pid = halves.right.parseIntRadix<u16>(16) ?? 0;
+    let number = (Process.argument(2) ?? "0").parseInt<u8>() ?? 0;
+    let inEp = (Process.argument(3) ?? "81").parseIntRadix<u8>(16) ?? 0x81;
+    let count = (Process.argument(4) ?? "0").parseInt<u64>() ?? 0;
+    let selector = usb.DeviceSelector.ids(vid, pid);
+    let info = match (usb.Usb.findDevice(borrow selector)) {
+        Ok(Some(i)) => i,
+        _ => {
+            Console.writeErrorLine("device not found");
+            Process.exit(1);
+        }
+    };
+    let device = usb.Usb.open(borrow info)!;
+    let iface = device.detachAndClaimInterface(number)!;
+    match (Process.argument(5)) {
+        Some(text) => {
+            let outEp = text.parseIntRadix<u8>(16) ?? 0x01;
+            var out = iface.openEndpointChecked(outEp, usb.TransferType.Interrupt, usb.Direction.Out)!;
+            let report = [0xA5u8; 64];
+            out.write(report[..], 1000)!;
+            Console.writeLine("sent one OUT report");
+        }
+        null => {}
+    }
+    var endpoint = iface.openEndpointChecked(inEp, usb.TransferType.Interrupt, usb.Direction.In)!;
+    let signals = ProcessSignals.subscribe()!;
+    Console.writeLine("reading interrupt reports; press Ctrl+C to stop");
+    match (Async.run(run(mut endpoint, count, borrow signals))) {
+        Ok(true) => { Console.writeLine("done"); }
+        Ok(false) => { Console.writeLine("stopped"); }
+        Err(Stop.Usb(e)) => {
+            Console.write("failed: ");
+            Console.writeLine(e.message());
+            Process.exit(1);
+        }
+        Err(Stop.Async(_)) => { Process.exit(1); }
+    }
+}

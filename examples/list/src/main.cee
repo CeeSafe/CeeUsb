@@ -1,0 +1,98 @@
+// Lists USB buses and devices, like lsusb, from the OS's cache (no device I/O).
+
+fn writeInfo(info: borrow usb.DeviceInfo) {
+    var line = [0u8; 512];
+    var w = TextWriter.create(mut line[..]);
+    w.text("Bus ");
+    w.text(info.busId.view());
+    w.text(" Device ");
+    w.decimal(info.address as u64);
+    w.text(": ID ");
+    info.write(mut w);
+    w.text(" [id ");
+    w.decimal(info.id.value);
+    w.text("]");
+    match (borrow info.manufacturer) {
+        Some(m) => {
+            w.text(" [");
+            w.text(m.view());
+            w.text("]");
+        }
+        null => {}
+    }
+    match (info.speed) {
+        Some(s) => {
+            w.text(" ");
+            w.text(usb.speedText(s));
+        }
+        null => {}
+    }
+    Console.writeLine(StringView.fromUtf8(w.written()) ?? "?");
+    for (i in info.interfaces.view()) {
+        var l2 = [0u8; 256];
+        var w2 = TextWriter.create(mut l2[..]);
+        w2.text("    interface ");
+        w2.decimal(i.number as u64);
+        w2.text(" class ");
+        w2.hex(i.interfaceClass as u64, 2);
+        w2.text(".");
+        w2.hex(i.interfaceSubclass as u64, 2);
+        w2.text(".");
+        w2.hex(i.interfaceProtocol as u64, 2);
+        match (borrow i.name) {
+            Some(n) => {
+                w2.text(" ");
+                w2.text(n.view());
+            }
+            null => {}
+        }
+        Console.writeLine(StringView.fromUtf8(w2.written()) ?? "?");
+    }
+}
+
+fn fail(e: usb.UsbError) {
+    var line = [0u8; 256];
+    var w = TextWriter.create(mut line[..]);
+    e.write(mut w);
+    Console.writeLine(StringView.fromUtf8(w.written()) ?? "?");
+}
+
+fn main() {
+    match (usb.Usb.listBuses()) {
+        Ok(buses) => {
+            for (b in buses.view()) {
+                Console.write("bus ");
+                Console.write(b.busId.view());
+                Console.write(" ");
+                match (borrow b.name) {
+                    Some(n) => { Console.write(n.view()); }
+                    null => {}
+                }
+                match (borrow b.driver) {
+                    Some(d) => {
+                        Console.write(" driver ");
+                        Console.write(d.view());
+                    }
+                    null => {}
+                }
+                Console.writeLine("");
+            }
+        }
+        Err(e) => { fail(e); }
+    }
+    let start = Clock.monotonicNanos();
+    match (usb.Usb.listDevices()) {
+        Ok(devices) => {
+            let took = Clock.monotonicNanos() - start;
+            for (d in devices.view()) {
+                writeInfo(d);
+            }
+            Console.write("enumerated ");
+            Console.write(devices.length);
+            Console.write(" devices in ");
+            Console.write(took / 1000);
+            Console.writeLine(" us");
+        }
+        Err(e) => { fail(e); }
+    }
+}

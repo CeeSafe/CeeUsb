@@ -1,0 +1,236 @@
+// Transfer test against Linux's Gadget Zero (g_zero, source/sink configuration, loaded with pattern=1) on the
+// dummy_hcd virtual host controller: every packet (512 bytes at high speed) holds bytes (i % 63), in both
+// directions. The gadget checks what we write after accepting it: a bad transfer completes, and the endpoint is
+// halted for the next one.
+// usage: gzero [seconds per streaming test]
+
+const PACKET: usize = 512;
+
+fn pass(what: StringView, ok: bool) {
+    Console.write(if (ok) "PASS " else "FAIL ");
+    Console.writeLine(what);
+}
+
+fn show(what: StringView, e: usb.UsbError) {
+    var line = [0u8; 256];
+    var w = TextWriter.create(mut line[..]);
+    w.text("FAIL ");
+    w.text(what);
+    w.text(": ");
+    e.write(mut w);
+    Console.writeLine(StringView.fromUtf8(w.written()) ?? "?");
+}
+
+/// Does `data` (a transfer's bytes, starting at a packet boundary) hold the pattern?
+fn patternOk(data: Slice<u8>) -> bool {
+    for (i in 0..data.length) {
+        if (data[i] != truncate<u8>((i % PACKET) % 63)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn fillPattern(data: SliceMut<u8>) {
+    for (i in 0..data.length) {
+        data[i] = truncate<u8>((i % PACKET) % 63);
+    }
+}
+
+fn rate(what: StringView, bytes: u64, ns: u64, transfers: u64) {
+    Console.write("     ");
+    Console.write(what);
+    Console.write(": ");
+    Console.write(bytes * 1000 / ns);
+    Console.write(" MB/s, ");
+    Console.write(transfers * 1000000000 / ns);
+    Console.writeLine(" transfers/s");
+}
+
+/// Streams IN for `seconds` with `depth` transfers of `size` in flight, checking every byte. MB/s, or 0 on failure.
+fn streamIn(ep: borrow mut usb.Endpoint, size: usize, depth: usize, seconds: u64) -> bool {
+    for (i in 0..depth) {
+        var b = ep.allocate(size).ok()!;
+        b.setRequested(size);
+        let _ = ep.submit(b);
+    }
+    let start = Clock.monotonicNanos();
+    let end = start + seconds * 1000000000;
+    var bytes: u64 = 0;
+    var transfers: u64 = 0;
+    var ok = true;
+    while (Clock.monotonicNanos() < end) {
+        let c = match (ep.waitComplete(2000)) {
+            Some(c) => c,
+            null => {
+                ok = false;
+                break;
+            }
+        };
+        if (!c.isSuccess() || c.actualLength != size || !patternOk(c.buffer.view())) {
+            ok = false;
+            break;
+        }
+        bytes += c.actualLength as u64;
+        transfers += 1;
+        var b = c.buffer;
+        b.clear();
+        let _ = ep.submit(b);
+    }
+    let ns = Clock.monotonicNanos() - start;
+    ep.cancelAll();
+    while (ep.pending() > 0) {
+        let _ = ep.waitComplete(2000);
+    }
+    var label = [0u8; 64];
+    var w = TextWriter.create(mut label[..]);
+    w.text("IN  ");
+    w.decimal(size as u64 / 1024);
+    w.text(" KiB x ");
+    w.decimal(depth as u64);
+    w.text(" in flight");
+    rate(StringView.fromUtf8(w.written()) ?? "", bytes, ns, transfers);
+    return ok && transfers > 0;
+}
+
+fn streamOut(ep: borrow mut usb.Endpoint, size: usize, depth: usize, seconds: u64) -> bool {
+    for (i in 0..depth) {
+        var b = ep.allocate(size).ok()!;
+        fillPattern(b.spare());
+        b.setLength(size);
+        let _ = ep.submit(b);
+    }
+    let start = Clock.monotonicNanos();
+    let end = start + seconds * 1000000000;
+    var bytes: u64 = 0;
+    var transfers: u64 = 0;
+    var ok = true;
+    while (Clock.monotonicNanos() < end) {
+        let c = match (ep.waitComplete(2000)) {
+            Some(c) => c,
+            null => {
+                ok = false;
+                break;
+            }
+        };
+        if (!c.isSuccess() || c.actualLength != size) {
+            ok = false;
+            break;
+        }
+        bytes += size as u64;
+        transfers += 1;
+        let _ = ep.submit(c.buffer); // still filled with the pattern: resubmitted as it is
+    }
+    let ns = Clock.monotonicNanos() - start;
+    while (ep.pending() > 0) {
+        let _ = ep.waitComplete(2000);
+    }
+    var label = [0u8; 64];
+    var w = TextWriter.create(mut label[..]);
+    w.text("OUT ");
+    w.decimal(size as u64 / 1024);
+    w.text(" KiB x ");
+    w.decimal(depth as u64);
+    w.text(" in flight");
+    rate(StringView.fromUtf8(w.written()) ?? "", bytes, ns, transfers);
+    return ok && transfers > 0;
+}
+
+async fn readOnce(ep: borrow mut usb.Endpoint, into: SliceMut<u8>) -> Result<usize, usb.UsbError> =>
+    await ep.readAsync(into);
+
+fn main() {
+    let seconds = (Process.argument(1) ?? "2").parseInt<u64>() ?? 2;
+    let selector = usb.DeviceSelector.ids(0x0525, 0xa4a0);
+    let info = match (usb.Usb.findDevice(borrow selector)) {
+        Ok(Some(i)) => i,
+        _ => {
+            Console.writeLine("FAIL Gadget Zero not found (modprobe g_zero pattern=1 on dummy_hcd)");
+            Process.exit(1);
+        }
+    };
+    let device = usb.Usb.open(borrow info)!;
+    pass("open", true);
+    match (device.claimInterface(0)) {
+        Ok(_) => { pass("plain claim while usbtest is bound (expected Busy)", false); }
+        Err(e) => { pass("plain claim while usbtest is bound is Busy", e.kind is usb.ErrorKind.Busy); }
+    }
+    let iface = match (device.detachAndClaimInterface(0)) {
+        Ok(i) => i,
+        Err(e) => {
+            show("detach and claim", e);
+            Process.exit(1);
+        }
+    };
+    pass("detach usbtest and claim interface 0", true);
+
+    var input = iface.openEndpoint(0x81)!;
+    var output = iface.openEndpoint(0x02)!;
+    pass("open bulk IN 0x81 and OUT 0x02", input.maxPacketSize() == 512 && output.maxPacketSize() == 512);
+    // A halt survives between programs (a previous run may have left one): start clean.
+    pass("clearHalt on both endpoints", input.clearHalt().isOk() && output.clearHalt().isOk());
+    let mapped = input.allocate(4096)!;
+    pass("usbfs zero-copy buffer (mmap)", mapped.isZeroCopy());
+
+    // One-shot read and write, with the data checked.
+    var one = [0u8; 4096];
+    match (input.read(mut one[..], 1000)) {
+        Ok(n) => { pass("read 4096 bytes, pattern intact", n == 4096 && patternOk(one[..])); }
+        Err(e) => { show("read", e); }
+    }
+    var data = [0u8; 4096];
+    fillPattern(mut data[..]);
+    match (output.write(data[..], 1000)) {
+        Ok() => { pass("write 4096 bytes (the gadget checks the pattern)", true); }
+        Err(e) => { show("write", e); }
+    }
+    // A wrong byte: that write completes, the gadget halts the endpoint, so the next write comes back as a stall;
+    // clearHalt recovers it.
+    data[100] = 0xEE;
+    pass("corrupt write is accepted by the bus", output.write(data[..], 1000).isOk());
+    data[100] = truncate<u8>(100 % 63);
+    match (output.write(data[..], 1000)) {
+        Ok() => { pass("the write after a corrupt one stalls", false); }
+        Err(e) => {
+            pass("the write after a corrupt one comes back as a stall", e.kind is usb.ErrorKind.Other && e.code == 32);
+        }
+    }
+    pass("clearHalt after the stall", output.clearHalt().isOk());
+    pass("writes after clearHalt", output.write(data[..], 1000).isOk() && output.write(data[..], 1000).isOk());
+
+    match (Async.run(readOnce(mut input, mut one[..]))) {
+        Ok(n) => { pass("async read, pattern intact", n == 4096 && patternOk(one[..])); }
+        Err(e) => { show("async read", e); }
+    }
+
+    // Streaming, every byte checked.
+    pass("stream IN, 16 KiB x 1", streamIn(mut input, 16384, 1, seconds));
+    pass("stream IN, 16 KiB x 8", streamIn(mut input, 16384, 8, seconds));
+    pass("stream IN, 64 KiB x 8", streamIn(mut input, 65536, 8, seconds));
+    pass("stream OUT, 16 KiB x 1", streamOut(mut output, 16384, 1, seconds));
+    pass("stream OUT, 16 KiB x 8", streamOut(mut output, 16384, 8, seconds));
+    pass("stream OUT, 64 KiB x 8", streamOut(mut output, 65536, 8, seconds));
+
+    // Reader over the endpoint: odd-sized reads across transfer boundaries keep the byte stream intact.
+    var reader = match (usb.Reader.create(input, 16384, 4)) {
+        Ok(r) => r,
+        Err(_) => {
+            pass("reader", false);
+            Process.exit(1);
+        }
+    };
+    var chunk = [0u8; 1000];
+    var at: usize = 0;
+    var intact = true;
+    while (at < 16384 * 16) {
+        let n = reader.read(mut chunk[..], 1000)!;
+        for (i in 0..n) {
+            if (chunk[i] != truncate<u8>(((at + i) % PACKET) % 63)) {
+                intact = false;
+            }
+        }
+        at += n;
+    }
+    pass("Reader: 256 KiB in 1000-byte reads, stream intact", intact);
+    Console.writeLine("done (dropping the interface reattaches usbtest)");
+}

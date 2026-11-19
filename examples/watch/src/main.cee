@@ -1,0 +1,42 @@
+// Prints devices arriving and leaving for a number of seconds (default 10), then stops the watcher.
+// usage: watch [seconds]
+
+fn main() {
+    let seconds = (Process.argument(1) ?? "10").parseInt<u64>() ?? 10;
+    let watcher = match (usb.Usb.watch()) {
+        Ok(w) => w,
+        Err(e) => {
+            Console.write("watch failed: ");
+            Console.writeLine(e.message());
+            Process.exit(1);
+        }
+    };
+    Console.writeLine("watching");
+    let end = Clock.monotonicNanos() + seconds * 1000000000;
+    while (Clock.monotonicNanos() < end) {
+        match (watcher.tryNext()) {
+            Some(usb.HotplugEvent.Arrived(info)) => {
+                var line = [0u8; 256];
+                var w = TextWriter.create(mut line[..]);
+                w.text("arrived: ");
+                info.write(mut w);
+                w.text(" (id ");
+                w.decimal(info.id.value);
+                w.text(")");
+                Console.writeLine(StringView.fromUtf8(w.written()) ?? "?");
+            }
+            Some(usb.HotplugEvent.Left(id)) => {
+                Console.write("left: ");
+                Console.writeLine(id.value);
+            }
+            null => {
+                let _ = Async.run(Timer.sleep(20));
+            }
+        }
+    }
+    let t = Clock.monotonicNanos();
+    let _ = watcher;
+    Console.write("stopped in ");
+    Console.write((Clock.monotonicNanos() - t) / 1000);
+    Console.writeLine(" us");
+}

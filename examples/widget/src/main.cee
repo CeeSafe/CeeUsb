@@ -1,0 +1,251 @@
+// Drives the usb-widget firmware (firmware/usb-widget, an ATmega32U4 board such as an Arduino Micro): normal
+// operation, then faults injected on purpose (stalls, short replies, silence, truncation) and the error each must
+// surface as. A port of the C# UsbWidgetTest sample; see its README in the C# repository for the protocol.
+//
+// NOT VERIFIED against the board: no ATmega32U4 was available while porting. It builds; the logic follows the C#
+// sample line for line apart from the error model (UsbError values instead of exceptions).
+
+const VENDOR_ID: u16 = 0x2341;
+const PRODUCT_ID: u16 = 0x8037;
+const REQ_GET_INFO: u8 = 0x01;
+const REQ_SET_LED: u8 = 0x02;
+const REQ_GET_LED: u8 = 0x03;
+const REQ_GET_UPTIME: u8 = 0x04;
+const REQ_GET_ECHOES: u8 = 0x05;
+const REQ_SET_FAULT: u8 = 0x10;
+const REQ_GET_FAULT: u8 = 0x11;
+const FAULT_NONE: u16 = 0;
+const FAULT_STALL: u16 = 1;
+const FAULT_SHORT: u16 = 2;
+const FAULT_SILENT: u16 = 3;
+const FAULT_TRUNCATE: u16 = 4;
+const TIMEOUT: u32 = 2000;
+
+struct Report {
+    passed: u32;
+    failed: u32;
+
+    fn check(borrow mut this, name: StringView, ok: bool, detail: StringView) {
+        if (ok) {
+            this.passed += 1;
+        } else {
+            this.failed += 1;
+        }
+        Console.write(if (ok) "  [pass] " else "  [FAIL] ");
+        Console.write(name);
+        Console.write("  ");
+        Console.writeLine(detail);
+    }
+}
+
+struct Widget<region r> {
+    iface: borrow(r) usb.Interface;
+    number: u8;
+
+    fn request(borrow this, request: u8, value: u16) -> usb.ControlRequest =>
+        usb.ControlRequest.vendor(usb.Recipient.Interface, request, value, this.number as u16);
+
+    fn controlIn(borrow this, request: u8, into: SliceMut<u8>) -> Result<usize, usb.UsbError> =>
+        this.iface.controlIn(this.request(request, 0), into, TIMEOUT);
+
+    fn controlOut(borrow this, request: u8, value: u16) -> Result<usize, usb.UsbError> {
+        let none: Slice<u8> = [];
+        return this.iface.controlOut(this.request(request, value), none, TIMEOUT);
+    }
+
+    fn setFault(borrow this, mode: u16) -> Result<usize, usb.UsbError> => this.controlOut(REQ_SET_FAULT, mode);
+
+    fn echoes(borrow this) -> u32 {
+        var b = [0u8; 4];
+        return match (this.controlIn(REQ_GET_ECHOES, mut b[..])) {
+            Ok(4) => b[..].readLE<u32>(0),
+            _ => 0,
+        };
+    }
+}
+
+/// Reads and discards what an IN endpoint still holds from an earlier run.
+fn drain(reader: borrow mut usb.Endpoint) {
+    var scratch = [0u8; 64];
+    for (i in 0..16) {
+        match (reader.read(mut scratch[..], 60)) {
+            Ok(n) => {
+                if (n == 0) {
+                    return;
+                }
+            }
+            Err(_) => {
+                return;
+            }
+        }
+    }
+}
+
+/// Is this the OS's code for a stalled pipe (Linux EPIPE, macOS kIOUSBPipeStalled, Windows ERROR_GEN_FAILURE)?
+fn isStall(e: usb.UsbError) -> bool => e.code == 32 || e.code == -536854449 || e.code == 31;
+
+fn find() -> usb.DeviceInfo? {
+    let selector = usb.DeviceSelector.ids(VENDOR_ID, PRODUCT_ID);
+    return match (usb.Usb.findDevice(borrow selector)) {
+        Ok(found) => found,
+        Err(_) => null,
+    };
+}
+
+fn main() {
+    var info = match (find()) {
+        Some(i) => i,
+        null => {
+            Console.writeErrorLine("device 2341:8037 not found");
+            Process.exit(1);
+        }
+    };
+    // Start from a reset device (the firmware's bulk endpoints do not survive a previous session). Windows has no
+    // reset; macOS invalidates the device across one, so it is found again.
+    if (cfg("!USB_OS_WINDOWS")) {
+        match (usb.Usb.open(borrow info)) {
+            Ok(pre) => {
+                let _ = pre.reset();
+            }
+            Err(_) => {}
+        }
+        for (i in 0..60) {
+            match (find()) {
+                Some(again) => {
+                    info = again;
+                    break;
+                }
+                null => {
+                    let _ = Async.run(Timer.sleep(100));
+                }
+            }
+        }
+    }
+    let device = usb.Usb.open(borrow info)!;
+    if (cfg("USB_OS_MACOS")) {
+        // macOS hands over a vendor-class interface only once the configuration is set explicitly.
+        let _ = device.setConfiguration(1);
+    }
+    // The vendor interface, found by class rather than by number.
+    var number: u8 = 255;
+    var epIn: u8 = 0;
+    var epOut: u8 = 0;
+    match (device.activeConfiguration()) {
+        Ok(c) => {
+            var groups = c.interfaces();
+            for (g in groups) {
+                let alt = g.first();
+                if (alt.interfaceClass() == 0xFF) {
+                    number = g.number;
+                    var eps = alt.endpoints();
+                    for (e in eps) {
+                        if (e.direction() is usb.Direction.In) {
+                            epIn = e.address();
+                        } else {
+                            epOut = e.address();
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    if (number == 255 || epIn == 0 || epOut == 0) {
+        Console.writeErrorLine("no vendor-class (0xFF) interface with a bulk endpoint pair");
+        Process.exit(1);
+    }
+    let iface = device.claimInterface(number)!;
+    let w = Widget { iface: borrow iface, number: number };
+    var writer = iface.openEndpointChecked(epOut, usb.TransferType.Bulk, usb.Direction.Out)!;
+    var reader = iface.openEndpointChecked(epIn, usb.TransferType.Bulk, usb.Direction.In)!;
+    let _ = reader.clearHalt();
+    let _ = writer.clearHalt();
+    drain(mut reader);
+    var report = Report { passed: 0, failed: 0 };
+
+    Console.writeLine("normal operation");
+    var infoBytes = [0u8; 64];
+    let infoLength = w.controlIn(REQ_GET_INFO, mut infoBytes[..]).ok() ?? 0;
+    let infoText = StringView.fromUtf8(infoBytes[0..infoLength]) ?? "";
+    report.check("GET_INFO", infoText.startsWith("usb-widget"), infoText);
+    var up = [0u8; 4];
+    let upOk = w.controlIn(REQ_GET_UPTIME, mut up[..]).isOk() && up[..].readLE<u32>(0) > 0;
+    report.check("GET_UPTIME", upOk, "");
+    var led = [0u8; 1];
+    let _ = w.controlOut(REQ_SET_LED, 1);
+    let _ = w.controlIn(REQ_GET_LED, mut led[..]);
+    let on = led[0];
+    let _ = w.controlOut(REQ_SET_LED, 0);
+    let _ = w.controlIn(REQ_GET_LED, mut led[..]);
+    report.check("SET_LED round trip", on == 1 && led[0] == 0, "");
+
+    let before = w.echoes();
+    var counting = [0u8; 32];
+    for (i in 0..32) {
+        counting[i] = truncate<u8>(i);
+    }
+    // 63, not 64: an echo of exactly wMaxPacketSize is followed by a zero-length packet.
+    let xs = [0x78u8; 63];
+    let hello = "hello widget".bytes();
+    let payloads = [hello, counting[..], xs[..]];
+    for (p in payloads) {
+        var received = [0u8; 64];
+        let ok = match (writer.write(p, 2000)) {
+            Ok() => match (reader.read(mut received[..], 2000)) {
+                Ok(n) => n == p.length && received[0..n] == p,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        report.check("bulk echo", ok, if (ok) "byte-identical" else "no matching reply");
+    }
+    report.check("echo counter", w.echoes() - before == 3, "the device processed them");
+
+    Console.writeLine("fault injection");
+    let _ = w.setFault(FAULT_SHORT);
+    var shortInfo = [0u8; 64];
+    let shortLength = w.controlIn(REQ_GET_INFO, mut shortInfo[..]).ok() ?? 0;
+    report.check("short control IN", shortLength > 0 && shortLength < infoLength, "a short read is data, not an error");
+    let _ = w.setFault(FAULT_NONE);
+
+    let _ = w.setFault(FAULT_STALL);
+    match (w.controlIn(REQ_GET_INFO, mut shortInfo[..])) {
+        Ok(_) => { report.check("stalled control IN", false, "expected a stall"); }
+        Err(e) => { report.check("stalled control IN", isStall(e), "UsbError with the OS's stall code"); }
+    }
+    var mode = [0u8; 1];
+    let _ = w.controlIn(REQ_GET_FAULT, mut mode[..]);
+    report.check("stall is recoverable", mode[0] == 1, "GET_FAULT still answers");
+    let _ = w.setFault(FAULT_NONE);
+    report.check("recovered after stall", (w.controlIn(REQ_GET_INFO, mut shortInfo[..]).ok() ?? 0) == infoLength, "");
+
+    drain(mut reader);
+    let _ = w.setFault(FAULT_SILENT);
+    let silentBefore = w.echoes();
+    let _ = writer.write("ignored payload".bytes(), 2000);
+    var scratch = [0u8; 64];
+    match (reader.read(mut scratch[..], 800)) {
+        Ok(n) => { report.check("silent bulk", false, "expected a timeout"); }
+        Err(e) => { report.check("silent bulk", e.kind is usb.ErrorKind.TimedOut, "TimedOut as expected"); }
+    }
+    report.check("silent bulk received", w.echoes() - silentBefore == 1, "the counter still moved");
+    let _ = w.setFault(FAULT_NONE);
+
+    let _ = w.setFault(FAULT_TRUNCATE);
+    let full = [0x79u8; 64];
+    let _ = writer.write(full[..], 2000);
+    let half = reader.read(mut scratch[..], 2000).ok() ?? 0;
+    report.check("truncated bulk", half == 32, "half the packet came back");
+    // Fault mode is sticky: always leave it off.
+    if (w.setFault(FAULT_NONE).isErr()) {
+        Console.writeLine("  (warning: could not clear the fault mode; reflash the board)");
+    }
+    Console.write(report.passed);
+    Console.write(" passed, ");
+    Console.write(report.failed);
+    Console.writeLine(" failed");
+    if (report.failed != 0) {
+        Process.exit(1);
+    }
+}

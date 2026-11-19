@@ -1,0 +1,1225 @@
+// The public API: Usb (enumeration), Device, Interface and Endpoint.
+//
+// Ownership replaces the C# version's hand-kept reference counts. A Device, Interface and Endpoint each hold an
+// Arc of the core below them, so an endpoint keeps its interface claimed and its device open for as long as it
+// lives, in any order of dropping, and may move to another thread. Platform dispatch is compile-time
+// (`if (cfg(...))`), so there is no backend interface and no virtual call on any path.
+
+/// Enumeration and opening.
+public struct Usb {
+    /// Every connected device, from the OS's cache (no device I/O, no open).
+    public fn listDevices() -> Result<Vector<DeviceInfo>, UsbError> {
+        var out = Vector<DeviceInfo>.create();
+        if (cfg("USB_OS_LINUX")) {
+            linuxListDevices(mut out)?;
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macListDevices(mut out)?;
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            winListDevices(mut out)?;
+        }
+        return Ok(out);
+    }
+
+    /// Every host controller.
+    public fn listBuses() -> Result<Vector<BusInfo>, UsbError> {
+        var out = Vector<BusInfo>.create();
+        if (cfg("USB_OS_LINUX")) {
+            linuxListBuses(mut out)?;
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macListBuses(mut out)?;
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            winListBuses(mut out)?;
+        }
+        return Ok(out);
+    }
+
+    /// `listDevices` for async code (on a worker thread while the task waits).
+    public async fn listDevicesAsync() -> Result<Vector<DeviceInfo>, UsbError> =>
+        await Async.blocking(() => Usb.listDevices());
+
+    /// `listBuses` for async code.
+    public async fn listBusesAsync() -> Result<Vector<BusInfo>, UsbError> =>
+        await Async.blocking(() => Usb.listBuses());
+
+    /// `open` for async code.
+    public async fn openAsync(info: borrow DeviceInfo) -> Result<Device, UsbError> =>
+        await Async.blocking(() => Device.open(info));
+
+    /// The first device that matches, or null.
+    public fn findDevice(selector: borrow DeviceSelector) -> Result<DeviceInfo?, UsbError> {
+        var devices = Usb.listDevices()?;
+        for (i in 0..devices.length) {
+            if (devices[i].matches(selector)) {
+                return Ok(Some(VectorEditing<DeviceInfo>.swapRemove(mut devices, i)));
+            }
+        }
+        return Ok(null);
+    }
+
+    /// Opens a device (Linux: its usbfs node; macOS: its user client, exclusively if possible; Windows: its WinUSB
+    /// interface).
+    public fn open(info: borrow DeviceInfo) -> Result<Device, UsbError> {
+        let r = Device.open(info);
+        if (tracing(TraceLevel.Debug)) {
+            var name = [0u8; 300];
+            var w = TextWriter.create(mut name[..]);
+            info.write(mut w);
+            if (info.path.length > 0) {
+                w.text(" at ");
+                w.text(info.path.view());
+            }
+            let text = StringView.fromUtf8(w.written()) ?? "";
+            match (borrow r) {
+                Ok(_) => {
+                    trace(TraceLevel.Debug, "opened", text, null);
+                }
+                Err(e) => {
+                    trace(TraceLevel.Debug, "open failed", text, Some(*e));
+                }
+            }
+        }
+        return r;
+    }
+
+    /// Starts watching for devices arriving and leaving. Make the watcher before listing devices, so that nothing
+    /// is missed between the two.
+    public fn watch() -> Result<Watcher, UsbError> => Watcher.create();
+}
+
+/// What the event loop and the OS need of a device, shared by its Device, Interfaces and Endpoints.
+///
+/// Thread-safe by declaration: after `open` only `claimed` changes (atomically); the native handles are used by
+/// the OS's own thread-safe calls, and closed once, in `drop`, after every Interface and Endpoint (each holding an
+/// Arc of this) is gone.
+@threadSafe
+struct DeviceCore {
+    descriptor: DeviceDescriptor;
+    /// Every configuration descriptor, back to back.
+    blob: Vector<u8>;
+    speed: Speed?;
+    /// Bit n: interface n is claimed through this device.
+    claimed: AtomicU32;
+    // Linux
+    fd: i32;
+    target: Box<EventTarget>?;
+    sysfsPath: String;
+    // macOS
+    mac: *mut void;
+    macExclusive: bool;
+    // Windows
+    win: WinDevice?;
+    /// A device of the tests: no OS handle; a test thread completes its transfers.
+    fake: bool;
+
+    /// Safety: each handle is closed once; the Linux target leaves the loop (with its barrier) before the fd closes.
+    drop {
+        if (cfg("USB_OS_LINUX")) {
+            match (borrow this.target) {
+                Some(t) => {
+                    linuxClose(this.fd, t);
+                }
+                null => {}
+            }
+        }
+        if (cfg("USB_OS_MACOS")) {
+            if (!this.mac.isNull()) {
+                macClose(this.mac, this.macExclusive);
+            }
+        }
+    }
+}
+
+/// An open device.
+public struct Device {
+    core: Arc<DeviceCore>;
+
+    fn open(info: borrow DeviceInfo) -> Result<Device, UsbError> {
+        var core = DeviceCore {
+            descriptor: DeviceDescriptor.fromFields(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            blob: Vector<u8>.create(),
+            speed: null,
+            claimed: AtomicU32.create(0),
+            fd: -1,
+            target: null,
+            sysfsPath: String.create(),
+            mac: 0 as *mut void,
+            macExclusive: false,
+            win: null,
+            fake: false,
+        };
+        if (cfg("USB_OS_LINUX")) {
+            var opened = linuxOpen(info.busNumber, info.address)?;
+            core.fd = opened.fd;
+            core.speed = opened.speed;
+            core.target = Some(opened.target);
+            let all = opened.blob.view();
+            match (DeviceDescriptor.parse(all)) {
+                Some(d) => {
+                    core.descriptor = d;
+                }
+                null => {
+                    return Err(UsbError.create(ErrorKind.Other, Operation.ReadDescriptors, 0));
+                }
+            }
+            if (core.blob.extend(all[18..]).isErr() || core.sysfsPath.append(info.path.view()).isErr()) {
+                return Err(UsbError.noMemory(Operation.Open));
+            }
+        }
+        if (cfg("USB_OS_MACOS")) {
+            let opened = macOpen(info.registryId)?;
+            core.mac = opened.device;
+            core.macExclusive = opened.exclusive;
+            core.descriptor = opened.descriptor;
+            core.speed = opened.speed;
+            core.blob = opened.blob;
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            let opened = winOpen(info)?;
+            core.descriptor = opened.descriptor;
+            core.speed = opened.speed;
+            core.blob = opened.blob;
+            core.win = Some(opened.device);
+        }
+        match (Arc<DeviceCore>.create(core)) {
+            Ok(a) => {
+                return Ok(Device { core: a });
+            }
+            Err(_) => {
+                return Err(UsbError.noMemory(Operation.Open));
+            }
+        }
+    }
+
+    /// A device with no OS behind it, over the given configuration blob: for the tests, which complete its
+    /// transfers themselves.
+    fn fake(configurations: Slice<u8>) -> Result<Device, AllocError> {
+        var blob = Vector<u8>.create();
+        blob.extend(configurations)?;
+        let core = DeviceCore {
+            descriptor: DeviceDescriptor.fromFields(0x0200, 0, 0, 0, 64, 0x1234, 0x5678, 0x0100, 0, 0, 0, 1),
+            blob: blob,
+            speed: Some(Speed.High),
+            claimed: AtomicU32.create(0),
+            fd: -1,
+            target: null,
+            sysfsPath: String.create(),
+            mac: 0 as *mut void,
+            macExclusive: false,
+            win: null,
+            fake: true,
+        };
+        return Ok(Device { core: Arc<DeviceCore>.create(core)? });
+    }
+
+    /// The device descriptor.
+    public fn descriptor(borrow this) -> DeviceDescriptor => this.core.get().descriptor;
+
+    /// The connection speed, when the OS says.
+    public fn speed(borrow this) -> Speed? => this.core.get().speed;
+
+    /// Every configuration descriptor, from the OS's cache.
+    public fn configurations(borrow this) -> ConfigurationIter => ConfigurationIter.over(this.core.get().blob.view());
+
+    /// The value of the active configuration, 0 when the device is not configured.
+    public fn activeConfigurationValue(borrow this) -> u8 {
+        let core = this.core.get();
+        if (core.fake) {
+            var first = ConfigurationIter.over(core.blob.view());
+            return match (first.next()) {
+                Some(c) => c.value(),
+                null => 0,
+            };
+        }
+        if (cfg("USB_OS_LINUX")) {
+            match (linuxActiveConfiguration(core.sysfsPath.view())) {
+                Some(v) => {
+                    return v;
+                }
+                null => {}
+            }
+        }
+        if (cfg("USB_OS_MACOS")) {
+            // With one configuration and interfaces published, it is the active one: no device I/O (nusb's guess).
+            return macActiveConfiguration(core.mac);
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            return winActiveConfiguration(core);
+        }
+        var it = ConfigurationIter.over(core.blob.view());
+        return match (it.next()) {
+            Some(c) => c.value(),
+            null => 0,
+        };
+    }
+
+    /// The active configuration's descriptor; NotFound when the device is unconfigured.
+    public fn activeConfiguration(borrow this) -> Result<ConfigurationDescriptor, UsbError> {
+        let value = this.activeConfigurationValue();
+        if (value != 0) {
+            var it = ConfigurationIter.over(this.core.get().blob.view());
+            for (c in it) {
+                if (c.value() == value) {
+                    return Ok(c);
+                }
+            }
+        }
+        return Err(UsbError.create(ErrorKind.NotFound, Operation.SetConfiguration, 0));
+    }
+
+    /// SET_CONFIGURATION. Not available on Windows. On macOS a vendor-class device often needs
+    /// `setConfiguration(1)` before its interfaces appear.
+    public fn setConfiguration(borrow this, value: u8) -> Result<void, UsbError> {
+        let core = this.core.get();
+        if (cfg("USB_OS_LINUX")) {
+            return linuxSetConfiguration(core.fd, value);
+        }
+        if (core.fake) {
+            return Ok();
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macRequireExclusive(core.mac, Operation.SetConfiguration)?;
+            return macSetConfiguration(core.mac, value);
+        }
+        return Err(UsbError.create(ErrorKind.Unsupported, Operation.SetConfiguration, 0));
+    }
+
+    /// `setConfiguration` for async code (on a worker thread while the task waits).
+    public async fn setConfigurationAsync(borrow this, value: u8) -> Result<void, UsbError> =>
+        await Async.blocking(() => this.setConfiguration(value));
+
+    /// `reset` for async code.
+    public async fn resetAsync(borrow this) -> Result<void, UsbError> => await Async.blocking(() => this.reset());
+
+    /// `claimInterface` for async code.
+    public async fn claimInterfaceAsync(borrow this, number: u8) -> Result<Interface, UsbError> =>
+        await Async.blocking(() => this.claimInterface(number));
+
+    /// `detachAndClaimInterface` for async code.
+    public async fn detachAndClaimInterfaceAsync(borrow this, number: u8) -> Result<Interface, UsbError> =>
+        await Async.blocking(() => this.detachAndClaimInterface(number));
+
+    /// Resets the device. Not available on Windows; on macOS the device re-enumerates with a new registry ID.
+    public fn reset(borrow this) -> Result<void, UsbError> {
+        let core = this.core.get();
+        if (cfg("USB_OS_LINUX")) {
+            return linuxReset(core.fd);
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macRequireExclusive(core.mac, Operation.Reset)?;
+            return macReset(core.mac);
+        }
+        return Err(UsbError.create(ErrorKind.Unsupported, Operation.Reset, 0));
+    }
+
+    /// Detaches the kernel driver bound to an interface (Linux; elsewhere it does nothing, as in nusb).
+    public fn detachKernelDriver(borrow this, number: u8) -> Result<void, UsbError> {
+        if (cfg("USB_OS_LINUX")) {
+            return linuxDetach(this.core.get().fd, number);
+        }
+        return Ok();
+    }
+
+    /// Reattaches the kernel driver of an interface (Linux; elsewhere it does nothing).
+    public fn attachKernelDriver(borrow this, number: u8) -> Result<void, UsbError> {
+        if (cfg("USB_OS_LINUX")) {
+            return linuxAttach(this.core.get().fd, number);
+        }
+        return Ok();
+    }
+
+    /// Claims an interface for exclusive use.
+    public fn claimInterface(borrow this, number: u8) -> Result<Interface, UsbError> =>
+        Interface.claim(borrow this.core, number, false);
+
+    /// Claims an interface, first detaching any kernel driver bound to it (Linux, atomically; the driver is
+    /// reattached when the interface is released). Elsewhere the same as `claimInterface`.
+    public fn detachAndClaimInterface(borrow this, number: u8) -> Result<Interface, UsbError> =>
+        Interface.claim(borrow this.core, number, true);
+
+    /// A control IN transfer on the default endpoint into `into` (its length is wLength); the bytes received.
+    /// `timeoutMs` 0 waits without limit. Not available on Windows, where control transfers go through a claimed
+    /// Interface.
+    public fn controlIn(
+        borrow this,
+        request: ControlRequest,
+        into: SliceMut<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        deviceControl(this.core.get(), request, Direction.In, into.ptr, into.length, timeoutMs);
+
+    /// A control OUT transfer on the default endpoint, sending `data`; the bytes sent.
+    public fn controlOut(
+        borrow this,
+        request: ControlRequest,
+        data: Slice<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        deviceControl(this.core.get(), request, Direction.Out, data.ptr as *mut u8, data.length, timeoutMs);
+
+    /// `controlIn` for async code: the blocking call runs on a worker thread while the task waits (a control
+    /// transfer is one blocking syscall on every platform: usbfs's CONTROL, IOKit's DeviceRequestTO, WinUSB's
+    /// ControlTransfer).
+    public async fn controlInAsync(
+        borrow this,
+        request: ControlRequest,
+        into: SliceMut<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        await Async.blocking(() => this.controlIn(request, into, timeoutMs));
+
+    /// `controlOut` for async code.
+    public async fn controlOutAsync(
+        borrow this,
+        request: ControlRequest,
+        data: Slice<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        await Async.blocking(() => this.controlOut(request, data, timeoutMs));
+
+    /// GET_DESCRIPTOR into `into`; the descriptor's bytes. On Windows it is answered through the parent hub (from
+    /// the hub driver's cache where it has one), so it needs no claimed interface and no WinUSB.
+    public fn getDescriptor(
+        borrow this,
+        descriptorType: u8,
+        index: u8,
+        languageId: u16,
+        into: SliceMut<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> {
+        if (cfg("USB_OS_WINDOWS")) {
+            return winGetDescriptor(this.core.get(), descriptorType, index, languageId, into);
+        }
+        return this.controlIn(getDescriptorRequest(descriptorType, index, languageId), into, timeoutMs);
+    }
+
+    /// The languages of the device's strings (string descriptor 0).
+    public fn stringLanguages(borrow this, timeoutMs: u32) -> Result<Vector<u16>, UsbError> {
+        var raw = [0u8; 255];
+        let n = this.getDescriptor(DESCRIPTOR_STRING, 0, 0, mut raw[..], timeoutMs)?;
+        var out = Vector<u16>.create();
+        match (decodeLanguageIds(raw[0..n], mut out)) {
+            Ok(true) => {
+                return Ok(out);
+            }
+            Ok(false) => {
+                return Err(UsbError.create(ErrorKind.Other, Operation.ReadDescriptors, 0));
+            }
+            Err(_) => {
+                return Err(UsbError.noMemory(Operation.ReadDescriptors));
+            }
+        }
+    }
+
+    /// A string descriptor, decoded. `index` 0 is the language list: use `stringLanguages`.
+    public fn getString(borrow this, index: u8, languageId: u16, timeoutMs: u32) -> Result<String, UsbError> {
+        if (index == 0) {
+            return Err(UsbError.create(ErrorKind.InvalidArgument, Operation.ReadDescriptors, 0));
+        }
+        var raw = [0u8; 255];
+        let n = this.getDescriptor(DESCRIPTOR_STRING, index, languageId, mut raw[..], timeoutMs)?;
+        var out = String.create();
+        match (decodeStringDescriptor(raw[0..n], mut out)) {
+            Ok(true) => {
+                return Ok(out);
+            }
+            Ok(false) => {
+                return Err(UsbError.create(ErrorKind.Other, Operation.ReadDescriptors, 0));
+            }
+            Err(_) => {
+                return Err(UsbError.noMemory(Operation.ReadDescriptors));
+            }
+        }
+    }
+}
+
+/// A control transfer on a device's default endpoint, synchronously, with zero allocation: the caller's memory
+/// is the data stage.
+fn deviceControl(
+    core: borrow DeviceCore,
+    request: ControlRequest,
+    direction: Direction,
+    data: *mut u8,
+    length: usize,
+    timeoutMs: u32,
+) -> Result<usize, UsbError> {
+    let n = match (checkedTruncate<u16>(length)) {
+        Some(v) => v,
+        null => {
+            return Err(UsbError.create(ErrorKind.InvalidArgument, Operation.ControlTransfer, 0));
+        }
+    };
+    let requestType = request.requestType(direction);
+    if (cfg("USB_OS_LINUX")) {
+        return linuxControl(core.fd, requestType, request, data, n, timeoutMs);
+    }
+    if (cfg("USB_OS_MACOS")) {
+        return macControl(core.mac, requestType, request, data, n, timeoutMs);
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.ControlTransfer, 0));
+}
+
+/// A claimed interface's shared state. Released (and on Linux, its kernel driver reattached) when the last
+/// holder (the Interface, or an Endpoint opened from it) drops.
+///
+/// Thread-safe by declaration: `alt` and `endpoints` are atomic; the native handles are used through the OS's
+/// thread-safe calls and released once, in `drop`.
+@threadSafe
+struct InterfaceCore {
+    device: Arc<DeviceCore>;
+    number: u8;
+    alt: AtomicU32;
+    /// Bit per endpoint address (see endpointBit): open endpoints.
+    endpoints: AtomicU32;
+    reattach: bool;
+    // macOS
+    mac: *mut void;
+    macSource: *void;
+    // Windows
+    win: WinInterface?;
+    /// False until the OS claim succeeded (and for a fake device): drop releases only a real claim.
+    live: bool;
+
+    /// Safety: no transfer is in flight here (every Endpoint drained its ring before dropping its Arc of this).
+    drop {
+        let device = this.device.get();
+        device.claimed.fetchAnd((1u32 << (this.number as u32 & 31)) ^ 0xFFFFFFFF);
+        if (!this.live) {
+            return;
+        }
+        if (cfg("USB_OS_LINUX")) {
+            linuxRelease(device.fd, this.number);
+            if (this.reattach) {
+                let _ = linuxAttach(device.fd, this.number);
+            }
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macRelease(this.mac, this.macSource);
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            match (borrow this.win) {
+                Some(w) => {
+                    winRelease(device, w);
+                }
+                null => {}
+            }
+        }
+    }
+}
+
+/// A claimed interface.
+public struct Interface {
+    core: Arc<InterfaceCore>;
+
+    fn claim(device: borrow Arc<DeviceCore>, number: u8, detach: bool) -> Result<Interface, UsbError> {
+        let d = device.get();
+        let bit = 1u32 << (number as u32 & 31);
+        if ((d.claimed.fetchOr(bit) & bit) != 0) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.ClaimInterface, 0));
+        }
+        var core = InterfaceCore {
+            device: device.clone(),
+            number: number,
+            alt: AtomicU32.create(0),
+            endpoints: AtomicU32.create(0),
+            reattach: false,
+            mac: 0 as *mut void,
+            macSource: 0 as *void,
+            win: null,
+            live: false,
+        };
+        var failure: UsbError? = null;
+        if (d.fake) {
+            // Tests: nothing to claim.
+        } else if (cfg("USB_OS_LINUX")) {
+            match (linuxClaim(d.fd, number, detach)) {
+                Ok() => {
+                    core.reattach = detach;
+                }
+                Err(e) => {
+                    failure = Some(e);
+                }
+            }
+        }
+        if (cfg("USB_OS_MACOS")) {
+            if (!d.fake) {
+                match (macClaim(d.mac, number)) {
+                    Ok(c) => {
+                        core.mac = c.iface;
+                        core.macSource = c.source;
+                        core.alt.store(c.alt as u32);
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                    }
+                }
+            }
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            if (!d.fake) {
+                match (winClaim(d, number)) {
+                    Ok(w) => {
+                        core.win = Some(w);
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                    }
+                }
+            }
+        }
+        match (failure) {
+            Some(e) => {
+                trace(TraceLevel.Debug, "claim failed", "", Some(e));
+                // Nothing was claimed: the core drops without the release path (live is false).
+                return Err(e);
+            }
+            null => {}
+        }
+        core.live = !d.fake;
+        match (Arc<InterfaceCore>.create(core)) {
+            Ok(a) => {
+                return Ok(Interface { core: a });
+            }
+            Err(_) => {
+                return Err(UsbError.noMemory(Operation.ClaimInterface));
+            }
+        }
+    }
+
+    /// The interface number.
+    public fn number(borrow this) -> u8 => this.core.get().number;
+
+    /// The current alternate setting.
+    public fn altSetting(borrow this) -> u8 => truncate<u8>(this.core.get().alt.load());
+
+    /// Selects an alternate setting; Busy while any endpoint is open.
+    public fn setAltSetting(borrow this, alt: u8) -> Result<void, UsbError> {
+        let core = this.core.get();
+        if (core.endpoints.load() != 0) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.SetAltSetting, 0));
+        }
+        if (cfg("USB_OS_LINUX")) {
+            linuxSetInterface(core.device.get().fd, core.number, alt)?;
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macSetAltSetting(core.mac, alt)?;
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            winSetAltSetting(core, alt)?;
+        }
+        core.alt.store(alt as u32);
+        return Ok();
+    }
+
+    /// `setAltSetting` for async code.
+    public async fn setAltSettingAsync(borrow this, alt: u8) -> Result<void, UsbError> =>
+        await Async.blocking(() => this.setAltSetting(alt));
+
+    /// Every alternate setting of this interface in the active configuration (none if the device is
+    /// unconfigured).
+    public fn altSettings(borrow this) -> InterfaceFilterIter {
+        let core = this.core.get();
+        let value = Device { core: core.device.clone() }.activeConfigurationValue();
+        let blob = core.device.get().blob.view();
+        var it = ConfigurationIter.over(blob);
+        for (c in it) {
+            if (c.value() == value) {
+                return c.altSettingsOf(core.number);
+            }
+        }
+        let none = ConfigurationDescriptor { bytes: blob[0..0] };
+        return none.altSettingsOf(core.number);
+    }
+
+    /// The descriptor of the current alternate setting in the active configuration, or null.
+    public fn descriptor(borrow this) -> InterfaceDescriptor? {
+        let core = this.core.get();
+        let value = Device { core: core.device.clone() }.activeConfigurationValue();
+        var it = ConfigurationIter.over(core.device.get().blob.view());
+        for (c in it) {
+            if (c.value() == value || value == 0) {
+                return c.findAltSetting(core.number, truncate<u8>(core.alt.load()));
+            }
+        }
+        return null;
+    }
+
+    /// A control IN transfer (see Device.controlIn). On Windows the only way to make one: through WinUSB, on a
+    /// claimed interface; an interface-recipient request must carry this interface's number in `index`.
+    public fn controlIn(
+        borrow this,
+        request: ControlRequest,
+        into: SliceMut<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        interfaceControl(this.core.get(), request, Direction.In, into.ptr, into.length, timeoutMs);
+
+    /// A control OUT transfer (see Device.controlOut).
+    public fn controlOut(
+        borrow this,
+        request: ControlRequest,
+        data: Slice<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        interfaceControl(this.core.get(), request, Direction.Out, data.ptr as *mut u8, data.length, timeoutMs);
+
+    /// `controlIn` for async code (on a worker thread while the task waits).
+    public async fn controlInAsync(
+        borrow this,
+        request: ControlRequest,
+        into: SliceMut<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        await Async.blocking(() => this.controlIn(request, into, timeoutMs));
+
+    /// `controlOut` for async code.
+    public async fn controlOutAsync(
+        borrow this,
+        request: ControlRequest,
+        data: Slice<u8>,
+        timeoutMs: u32,
+    ) -> Result<usize, UsbError> =>
+        await Async.blocking(() => this.controlOut(request, data, timeoutMs));
+
+    /// Opens a bulk or interrupt endpoint of the current alternate setting, with room for DEFAULT_RING transfers
+    /// in flight.
+    public fn openEndpoint(borrow this, address: u8) -> Result<Endpoint, UsbError> =>
+        this.openEndpointWith(address, DEFAULT_RING);
+
+    /// Opens an endpoint and checks that it is of the transfer type and direction the caller expects:
+    /// InvalidArgument otherwise (the C# overload threw).
+    public fn openEndpointChecked(
+        borrow this,
+        address: u8,
+        kind: TransferType,
+        direction: Direction,
+    ) -> Result<Endpoint, UsbError> {
+        if (!(directionOf(address) is Direction.In) != !(direction is Direction.In)) {
+            return Err(UsbError.create(ErrorKind.InvalidArgument, Operation.OpenEndpoint, 0));
+        }
+        let ep = this.openEndpoint(address)?;
+        if (transferTypeCode(ep.transferType()) != transferTypeCode(kind)) {
+            return Err(UsbError.create(ErrorKind.InvalidArgument, Operation.OpenEndpoint, 0));
+        }
+        return Ok(ep);
+    }
+
+    /// Opens an endpoint with room for `ring` transfers in flight (at least 1).
+    public fn openEndpointWith(borrow this, address: u8, ring: usize) -> Result<Endpoint, UsbError> {
+        let core = this.core.get();
+        var kind = TransferType.Control;
+        var packet: usize = 0;
+        match (this.descriptor()) {
+            Some(d) => {
+                match (d.findEndpoint(address)) {
+                    Some(e) => {
+                        kind = e.transferType();
+                        packet = e.maxPacketSize();
+                    }
+                    null => {
+                        return Err(UsbError.create(ErrorKind.NotFound, Operation.OpenEndpoint, 0));
+                    }
+                }
+            }
+            null => {
+                return Err(UsbError.create(ErrorKind.NotFound, Operation.OpenEndpoint, 0));
+            }
+        }
+        if (!(kind is TransferType.Bulk) && !(kind is TransferType.Interrupt)) {
+            return Err(UsbError.create(ErrorKind.Unsupported, Operation.OpenEndpoint, 0));
+        }
+        var pipe: u8 = 0;
+        let fake = core.device.get().fake;
+        if (cfg("USB_OS_MACOS")) {
+            match (if (fake) Some(1u8) else macPipeRef(core.mac, address)) {
+                Some(p) => {
+                    pipe = p;
+                }
+                null => {
+                    return Err(UsbError.create(ErrorKind.NotFound, Operation.OpenEndpoint, 0));
+                }
+            }
+        }
+        let bit = endpointBit(address);
+        if ((core.endpoints.fetchOr(bit) & bit) != 0) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.OpenEndpoint, 0));
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            if (!fake) {
+                winOpenPipe(core, address);
+            }
+        }
+        let size = if (ring == 0) 1 else ring;
+        let made = makeRing(size);
+        var buffers = Vector<Buffer?>.create();
+        var ok = made.isOk();
+        for (i in 0..size as u64) {
+            if (ok && buffers.push(null).isErr()) {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            core.endpoints.fetchAnd(bit ^ 0xFFFFFFFF);
+            return Err(UsbError.noMemory(Operation.OpenEndpoint));
+        }
+        return Ok(Endpoint {
+            iface: this.core.clone(),
+            ring: made!,
+            buffers: buffers,
+            head: 0,
+            tail: 0,
+            inFlight: 0,
+            addr: address,
+            kind: kind,
+            packet: if (packet == 0) 1 else packet,
+            fd: core.device.get().fd,
+            pipe: pipe,
+            scratch: null,
+            fake: core.device.get().fake,
+        });
+    }
+}
+
+/// A control transfer through a claimed interface: WinUSB on Windows, the device's default endpoint elsewhere.
+fn interfaceControl(
+    core: borrow InterfaceCore,
+    request: ControlRequest,
+    direction: Direction,
+    data: *mut u8,
+    length: usize,
+    timeoutMs: u32,
+) -> Result<usize, UsbError> {
+    if (cfg("USB_OS_WINDOWS")) {
+        return winControl(core, request, direction, data, length, timeoutMs);
+    }
+    return deviceControl(core.device.get(), request, direction, data, length, timeoutMs);
+}
+
+/// An open bulk or interrupt endpoint, with its ring of transfers in flight.
+///
+/// Throughput comes from keeping several transfers queued: `submit` a few buffers, then loop on `nextComplete`
+/// (or `waitComplete`), resubmitting each buffer that comes back. Completions arrive in submission order.
+public struct Endpoint {
+    iface: Arc<InterfaceCore>;
+    ring: Box<Ring>;
+    /// The buffer of each slot while it is in flight or finished but not yet taken.
+    buffers: Vector<Buffer?>;
+    /// The oldest slot not yet taken, and the next slot to submit into.
+    head: usize;
+    tail: usize;
+    inFlight: usize;
+    addr: u8;
+    kind: TransferType;
+    packet: usize;
+    fd: i32;
+    pipe: u8;
+    /// The buffer `read` and `write` reuse, made on first use.
+    scratch: Buffer?;
+    /// A fake device's endpoint (tests): submit leaves the slot PENDING for the test to complete.
+    fake: bool;
+
+    public fn address(borrow this) -> u8 => this.addr;
+    public fn direction(borrow this) -> Direction => directionOf(this.addr);
+    public fn transferType(borrow this) -> TransferType => this.kind;
+    public fn maxPacketSize(borrow this) -> usize => this.packet;
+    /// Transfers submitted and not yet taken.
+    public fn pending(borrow this) -> usize => this.inFlight;
+    /// How many transfers can be in flight at once.
+    public fn capacity(borrow this) -> usize => this.buffers.length;
+
+    /// A buffer for this endpoint: usbfs-mapped (zero-copy) memory on Linux when the kernel allows, heap memory
+    /// otherwise.
+    public fn allocate(borrow this, capacity: usize) -> Result<Buffer, UsbError> {
+        if (cfg("USB_OS_LINUX")) {
+            if (capacity > 0) {
+                match (Buffer.mapUsbfs(this.fd, capacity)) {
+                    Some(b) => {
+                        return Ok(b);
+                    }
+                    null => {
+                        trace(TraceLevel.Debug, "usbfs mmap failed; using a heap buffer", "", null);
+                    }
+                }
+            }
+        }
+        match (Buffer.create(capacity)) {
+            Ok(b) => {
+                return Ok(b);
+            }
+            Err(_) => {
+                return Err(UsbError.noMemory(Operation.Transfer));
+            }
+        }
+    }
+
+    /// Queues a transfer: an OUT transfer sends `buffer.length()` bytes; an IN transfer asks for
+    /// `buffer.requested()` bytes, which must be a nonzero multiple of the packet size. Failures (including that
+    /// one) come back as the transfer's Completion, in order. Only a full ring refuses: the buffer is given back.
+    /// Safety: the slot is FREE (the ring is not full) and owned by this endpoint until reaped; the buffer moves
+    /// into `buffers`, where it stays, unmoved on the heap, until the transfer is taken.
+    public fn submit(borrow mut this, buffer: Buffer) -> Result<void, Buffer> {
+        if (this.inFlight == this.buffers.length) {
+            return Err(buffer);
+        }
+        let index = this.tail;
+        this.tail = (index + 1) % this.buffers.length;
+        this.inFlight += 1;
+        this.buffers[index] = Some(buffer);
+        let slot = borrow mut this.ring.slots[index] as *mut Slot;
+        let ring: borrow Ring = borrow this.ring;
+        let isIn = (this.addr & 0x80) != 0;
+        unsafe { Ptr.toBorrow(slot as *Slot).state.store(SLOT_PENDING); }
+        ring.outstanding.fetchAdd(1);
+        var pointer: *mut u8 = 0 as *mut u8;
+        var length: usize = 0;
+        match (borrow mut this.buffers[index]) {
+            Some(b) => {
+                pointer = b.pointer();
+                length = if (isIn) b.requested() else b.length();
+            }
+            null => {}
+        }
+        if (isIn && (length == 0 || length % this.packet != 0)) {
+            traceNumber(
+                TraceLevel.Warn,
+                "IN transfer refused: requested length is not a nonzero multiple of the packet size:",
+                length as u64,
+            );
+            unsafe { completeSlot(slot, TransferStatus.InvalidArgument, 0, 0); }
+            return Ok();
+        }
+        if (this.fake) {
+            return Ok();
+        }
+        if (cfg("USB_OS_LINUX")) {
+            linuxSubmit(this.fd, slot, this.addr, this.kind is TransferType.Interrupt, pointer, length);
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macSubmit(this.iface.get().mac, this.pipe, isIn, slot, pointer, length);
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            winSubmit(this.iface.get(), this.addr, slot, pointer, length);
+        }
+        return Ok();
+    }
+
+    /// The oldest transfer, if it has finished; never waits.
+    public fn tryComplete(borrow mut this) -> Completion? {
+        if (this.inFlight == 0) {
+            return null;
+        }
+        let index = this.head;
+        let s = borrow this.ring.slots[index];
+        if (s.state.loadWith(LoadOrdering.Acquire) != SLOT_DONE) {
+            return null;
+        }
+        let status = statusFromCode(s.status);
+        let actual = s.actual as usize;
+        let code = s.code;
+        s.state.store(SLOT_FREE);
+        this.head = (index + 1) % this.buffers.length;
+        this.inFlight -= 1;
+        var buffer = replace(mut this.buffers[index], null)!;
+        if ((this.addr & 0x80) != 0) {
+            buffer.setLength(actual);
+        }
+        return Some(Completion { buffer: buffer, status: status, actualLength: actual, code: code });
+    }
+
+    /// Waits for the oldest transfer to finish and takes it. `Err(Closed)` if nothing is pending; cancel-safe
+    /// (a cancelled wait takes nothing, and the transfer stays queued).
+    public async fn nextComplete(borrow mut this) -> Result<Completion, AsyncError> {
+        if (this.inFlight == 0) {
+            return Err(AsyncError.Closed);
+        }
+        loop {
+            match (this.tryComplete()) {
+                Some(c) => {
+                    return Ok(c);
+                }
+                null => {}
+            }
+            await this.ring.signal.wait()?;
+        }
+    }
+
+    /// Blocks until the oldest transfer finishes and takes it; null on timeout (`timeoutMs` 0: no limit) or if
+    /// nothing is pending.
+    public fn waitComplete(borrow mut this, timeoutMs: u64) -> Completion? {
+        if (this.inFlight == 0) {
+            return null;
+        }
+        let deadline = if (timeoutMs == 0) 0u64 else Clock.monotonicNanos() + timeoutMs * 1000000;
+        loop {
+            match (this.tryComplete()) {
+                Some(c) => {
+                    return Some(c);
+                }
+                null => {}
+            }
+            var wait: u64 = 0;
+            if (deadline != 0) {
+                let now = Clock.monotonicNanos();
+                if (now >= deadline) {
+                    return null;
+                }
+                wait = (deadline - now + 999999) / 1000000;
+            }
+            waitSignal(borrow this.ring, wait);
+        }
+    }
+
+    /// Asks the OS to give every pending transfer back early; they complete as Cancelled (possibly with partial
+    /// data), in order. Linux cancels newest first, so a later transfer cannot slip in ahead of an earlier one.
+    /// Safety: only slots between head and tail are touched; their addresses name this endpoint's URBs or none.
+    public fn cancelAll(borrow mut this) {
+        if (this.inFlight == 0) {
+            return;
+        }
+        if (this.fake) {
+            // A fake device's "OS" answers a cancel as a real one does: the pending transfers come back Cancelled.
+            // (The tests stop their completing thread before anything cancels.)
+            for (k in 0..this.inFlight) {
+                let index = (this.head + k) % this.buffers.length;
+                let slot = borrow mut this.ring.slots[index] as *mut Slot;
+                if (unsafe { Ptr.toBorrow(slot as *Slot).state.load() } == SLOT_PENDING) {
+                    unsafe { completeSlot(slot, TransferStatus.Cancelled, 0, 0); }
+                }
+            }
+            return;
+        }
+        if (cfg("USB_OS_MACOS")) {
+            macAbort(this.iface.get().mac, this.pipe);
+            return;
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            winAbort(this.iface.get(), this.addr);
+            return;
+        }
+        let size = this.buffers.length;
+        var k = this.inFlight;
+        while (k > 0) {
+            k -= 1;
+            let index = (this.head + k) % size;
+            let slot = borrow mut this.ring.slots[index] as *mut Slot;
+            if (unsafe { Ptr.toBorrow(slot as *Slot).state.load() } == SLOT_PENDING) {
+                if (cfg("USB_OS_LINUX")) {
+                    linuxDiscard(this.fd, slot);
+                }
+            }
+        }
+    }
+
+    /// `clearHalt` for async code.
+    public async fn clearHaltAsync(borrow this) -> Result<void, UsbError> =>
+        await Async.blocking(() => this.clearHalt());
+
+    /// Clears a halt (stall) on the endpoint and resets its data toggle.
+    public fn clearHalt(borrow this) -> Result<void, UsbError> {
+        if (cfg("USB_OS_LINUX")) {
+            return linuxClearHalt(this.fd, this.addr);
+        }
+        if (cfg("USB_OS_MACOS")) {
+            return macClearHalt(this.iface.get().mac, this.pipe);
+        }
+        if (cfg("USB_OS_WINDOWS")) {
+            return winClearHalt(this.iface.get(), this.addr);
+        }
+        return Err(UsbError.create(ErrorKind.Unsupported, Operation.ClearHalt, 0));
+    }
+
+    /// One transfer, blocking: submits `buffer`, waits up to `timeoutMs` (0: no limit), and on timeout cancels it
+    /// and waits for it to come back (as Cancelled). Requires nothing else pending.
+    public fn transfer(borrow mut this, buffer: Buffer, timeoutMs: u64) -> Result<Completion, UsbError> {
+        if (this.inFlight != 0) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.Transfer, 0));
+        }
+        if (this.submit(buffer).isErr()) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.Transfer, 0));
+        }
+        match (this.waitComplete(timeoutMs)) {
+            Some(c) => {
+                return Ok(c);
+            }
+            null => {}
+        }
+        this.cancelAll();
+        loop {
+            match (this.waitComplete(1000)) {
+                Some(c) => {
+                    return Ok(c);
+                }
+                null => {
+                    this.cancelAll();
+                }
+            }
+        }
+    }
+
+    /// Reads one transfer into `into` (asking for its length rounded down to whole packets, at least one packet);
+    /// the bytes received. A timeout is `Err(TimedOut)`. The endpoint's scratch buffer is reused, so a read loop
+    /// allocates (or, on Linux, maps) once, not per call.
+    public fn read(borrow mut this, into: SliceMut<u8>, timeoutMs: u64) -> Result<usize, UsbError> {
+        let packets = into.length / this.packet;
+        let want = (if (packets == 0) 1 else packets) * this.packet;
+        var buffer = this.takeScratch(want)?;
+        buffer.clear();
+        buffer.setRequested(want);
+        let c = this.transfer(buffer, timeoutMs)?;
+        let status = c.status;
+        let code = c.code;
+        let n = if (c.actualLength < into.length) c.actualLength else into.length;
+        into[0..n].copyFrom(c.buffer.view()[0..n]);
+        this.scratch = Some(c.buffer);
+        match (status) {
+            TransferStatus.Success => {
+                return Ok(n);
+            }
+            TransferStatus.Cancelled => {
+                return Err(UsbError.create(ErrorKind.TimedOut, Operation.Transfer, code));
+            }
+            _ => {
+                return Err(transferError(status, code, Operation.Transfer));
+            }
+        }
+    }
+
+    /// Writes `data` as one transfer. A timeout is `Err(TimedOut)`.
+    public fn write(borrow mut this, data: Slice<u8>, timeoutMs: u64) -> Result<void, UsbError> {
+        var buffer = this.takeScratch(data.length)?;
+        buffer.clear();
+        buffer.append(data);
+        let c = this.transfer(buffer, timeoutMs)?;
+        let status = c.status;
+        let code = c.code;
+        this.scratch = Some(c.buffer);
+        match (status) {
+            TransferStatus.Success => {
+                return Ok();
+            }
+            TransferStatus.Cancelled => {
+                return Err(UsbError.create(ErrorKind.TimedOut, Operation.Transfer, code));
+            }
+            _ => {
+                return Err(transferError(status, code, Operation.Transfer));
+            }
+        }
+    }
+
+    /// Reads one transfer, waiting as a task; cancelling the task cancels the transfer.
+    public async fn readAsync(borrow mut this, into: SliceMut<u8>) -> Result<usize, UsbError> {
+        let packets = into.length / this.packet;
+        let want = (if (packets == 0) 1 else packets) * this.packet;
+        var buffer = this.takeScratch(want)?;
+        buffer.clear();
+        buffer.setRequested(want);
+        let c = await this.submitAndWait(buffer)?;
+        let status = c.status;
+        let code = c.code;
+        let n = if (c.actualLength < into.length) c.actualLength else into.length;
+        into[0..n].copyFrom(c.buffer.view()[0..n]);
+        this.scratch = Some(c.buffer);
+        if (status is TransferStatus.Success) {
+            return Ok(n);
+        }
+        return Err(transferError(status, code, Operation.Transfer));
+    }
+
+    /// Writes one transfer, waiting as a task.
+    public async fn writeAsync(borrow mut this, data: Slice<u8>) -> Result<void, UsbError> {
+        var buffer = this.takeScratch(data.length)?;
+        buffer.clear();
+        buffer.append(data);
+        let c = await this.submitAndWait(buffer)?;
+        let status = c.status;
+        let code = c.code;
+        this.scratch = Some(c.buffer);
+        if (status is TransferStatus.Success) {
+            return Ok();
+        }
+        return Err(transferError(status, code, Operation.Transfer));
+    }
+
+    /// Submits and waits for the one transfer; if the task is cancelled meanwhile, cancels the transfer and waits
+    /// for it (shielded) so that its buffer is back before this returns.
+    async fn submitAndWait(borrow mut this, buffer: Buffer) -> Result<Completion, UsbError> {
+        if (this.inFlight != 0) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.Transfer, 0));
+        }
+        if (this.submit(buffer).isErr()) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.Transfer, 0));
+        }
+        match (await this.nextComplete()) {
+            Ok(c) => {
+                return Ok(c);
+            }
+            Err(_) => {}
+        }
+        // Cancelled while waiting: give the transfer back early and wait for it, shielded, so the buffer is home
+        // before this returns.
+        this.cancelAll();
+        match (await Async.shield(5000, async () => await this.nextComplete())) {
+            Ok(c) => {
+                this.scratch = Some(c.buffer);
+            }
+            Err(_) => {}
+        }
+        return Err(UsbError.create(ErrorKind.Cancelled, Operation.Transfer, 0));
+    }
+
+    /// The scratch buffer if it is big enough, else a new one.
+    fn takeScratch(borrow mut this, size: usize) -> Result<Buffer, UsbError> {
+        match (replace(mut this.scratch, null)) {
+            Some(b) => {
+                if (b.size() >= size) {
+                    return Ok(b);
+                }
+            }
+            null => {}
+        }
+        return this.allocate(if (size < this.packet) this.packet else size);
+    }
+
+    /// Cancels and drains every transfer, so the OS holds nothing of this endpoint when its ring is freed. Waits
+    /// on plain sleeps, not an executor, since a drop may run anywhere.
+    fn drain(borrow mut this) {
+        if (this.ring.outstanding.load() == 0) {
+            return;
+        }
+        this.cancelAll();
+        var waited: u32 = 0;
+        while (this.ring.outstanding.load() != 0) {
+            if (waited < 200) {
+                yieldThread();
+            } else {
+                sleepMs(1);
+            }
+            waited += 1;
+            if (waited % 1000 == 0) {
+                this.cancelAll();
+            }
+        }
+    }
+
+    drop {
+        this.drain();
+        this.iface.get().endpoints.fetchAnd(endpointBit(this.addr) ^ 0xFFFFFFFF);
+    }
+}
+
+/// Blocks this thread until the ring's signal is raised or `ms` pass (0: no limit).
+fn waitSignal(ring: borrow Ring, ms: u64) {
+    if (ms == 0) {
+        let _ = Async.run(ring.signal.wait());
+        return;
+    }
+    let _ = Async.run(timedWait(ring, ms));
+}
+
+async fn timedWait(ring: borrow Ring, ms: u64) -> Result<void, AsyncError> {
+    await Async.timeout(ms, AsyncError.TimedOut, async () => await ring.signal.wait())?;
+    return Ok();
+}

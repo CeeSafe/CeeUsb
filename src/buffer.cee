@@ -1,0 +1,135 @@
+// Transfer buffers. A Buffer is owned by the caller, moved into the endpoint by `submit`, and moved back out in
+// the Completion, so a streaming loop reuses the same few buffers forever with no allocation and no pinning.
+
+@header("usb_os.h")
+extern "C" {}
+
+const PROT_READ_WRITE: i32 = 3;
+const MAP_SHARED: i32 = 1;
+
+/// Bytes for a transfer, with a fill length (`length`, what an OUT transfer sends and an IN transfer received)
+/// and a requested length (`requested`, what an IN transfer asks for; it survives the transfer, so the buffer can
+/// be resubmitted as it is).
+///
+/// On Linux, `Endpoint.allocate` gives memory mapped from usbfs: the controller reads and writes it directly, with
+/// no copy in the kernel. Elsewhere it is ordinary heap memory.
+///
+/// Thread-safe by declaration: the native pointer is owned by this value alone (it is unmapped in `drop`), so the
+/// buffer may move between threads like a Vector.
+@threadSafe
+public struct Buffer {
+    heap: Vector<u8>;
+    mapped: *mut u8;
+    capacity: usize;
+    filled: usize;
+    asked: usize;
+
+    /// A heap buffer of `capacity` bytes, zeroed, with length 0 and requested length `capacity`.
+    public fn create(capacity: usize) -> Result<Buffer, AllocError> {
+        var heap = Vector<u8>.create();
+        heap.resize(capacity, 0)?;
+        return Ok(Buffer { heap: heap, mapped: 0 as *mut u8, capacity: capacity, filled: 0, asked: capacity });
+    }
+
+    /// A heap buffer holding a copy of `data` (length and requested length both `data.length`).
+    public fn from(data: Slice<u8>) -> Result<Buffer, AllocError> {
+        var heap = Vector<u8>.create();
+        heap.extend(data)?;
+        let n = data.length;
+        return Ok(Buffer { heap: heap, mapped: 0 as *mut u8, capacity: n, filled: n, asked: n });
+    }
+
+    /// A buffer over usbfs-mapped memory, or null if the mapping failed (old kernels, no memory).
+    /// Safety: mmap of a usbfs descriptor; the mapping is owned by the Buffer and unmapped in its drop.
+    fn mapUsbfs(fd: i32, capacity: usize) -> Buffer? {
+        if (cfg("USB_OS_POSIX")) {
+            let p = unsafe { mmap(0 as *mut void, capacity, PROT_READ_WRITE, MAP_SHARED, fd, 0) };
+            // MAP_FAILED is (void *)-1.
+            if (p.isNull() || (p as usize) == 0usize.wrappingSub(1)) {
+                return null;
+            }
+            return Some(
+                Buffer {
+                    heap: Vector<u8>.create(),
+                    mapped: p as *mut u8,
+                    capacity: capacity,
+                    filled: 0,
+                    asked: capacity,
+                },
+            );
+        }
+        return null;
+    }
+
+    /// Bytes filled.
+    public fn length(borrow this) -> usize => this.filled;
+    /// Bytes an IN transfer asks for.
+    public fn requested(borrow this) -> usize => this.asked;
+    public fn size(borrow this) -> usize => this.capacity;
+    public fn isEmpty(borrow this) -> bool => this.filled == 0;
+    /// True for kernel-mapped (zero-copy) memory.
+    public fn isZeroCopy(borrow this) -> bool => !this.mapped.isNull();
+
+    /// Sets how many bytes an IN transfer asks for; at most the capacity.
+    public fn setRequested(borrow mut this, n: usize) {
+        this.asked = if (n > this.capacity) this.capacity else n;
+    }
+
+    /// Length 0, contents kept.
+    public fn clear(borrow mut this) {
+        this.filled = 0;
+    }
+
+    /// The filled bytes.
+    /// Safety: `mapped` is a live mapping of `capacity` bytes owned by this buffer.
+    public fn view(borrow this) -> Slice<u8> {
+        if (this.mapped.isNull()) {
+            return this.heap.view()[0..this.filled];
+        }
+        return unsafe { Slice.fromRaw(this.mapped as *u8, this.filled) };
+    }
+
+    /// The whole capacity, to fill in place; then `setLength` says how much was written.
+    /// Safety: as `view`.
+    public fn spare(borrow mut this) -> SliceMut<u8> {
+        if (this.mapped.isNull()) {
+            return this.heap.viewMut();
+        }
+        return unsafe { SliceMut.fromRaw(this.mapped, this.capacity) };
+    }
+
+    /// Sets the filled length (at most the capacity), after writing through `spare`.
+    public fn setLength(borrow mut this, n: usize) {
+        this.filled = if (n > this.capacity) this.capacity else n;
+    }
+
+    /// Appends `data`; false (and nothing copied) if it does not fit.
+    public fn append(borrow mut this, data: Slice<u8>) -> bool {
+        let at = this.filled;
+        if (data.length > this.capacity - at) {
+            return false;
+        }
+        let room = this.spare();
+        room[at..at + data.length].copyFrom(data);
+        this.filled = at + data.length;
+        return true;
+    }
+
+    /// The address the OS reads or writes.
+    fn pointer(borrow mut this) -> *mut u8 {
+        if (this.mapped.isNull()) {
+            return this.heap.viewMut().ptr;
+        }
+        return this.mapped;
+    }
+
+    /// Safety: the mapping is this buffer's own; nothing else refers to it once the buffer is dropped (a buffer in
+    /// flight is owned by its endpoint, which never drops it before the transfer is reaped).
+    drop {
+        if (cfg("USB_OS_POSIX")) {
+            if (!this.mapped.isNull()) {
+                unsafe { munmap(this.mapped as *mut void, this.capacity); }
+            }
+        }
+    }
+}

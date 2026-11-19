@@ -1,0 +1,186 @@
+// API behaviour, ported from the C# DeviceTests, EndpointTests, ExceptionTests and ReaderWriterTests where they
+// apply: selectors, the active configuration, opening a device that is gone, endpoint checks, timeouts that
+// cancel, zero-length packets, and readers that drain.
+
+fn fakeInfo() -> DeviceInfo {
+    var interfaces = Vector<InterfaceInfo>.create();
+    interfaces.push(
+        InterfaceInfo { number: 0, interfaceClass: 0xFF, interfaceSubclass: 0, interfaceProtocol: 0, name: null },
+    )!;
+    return DeviceInfo {
+        id: DeviceId { value: 1 },
+        busId: String.from("001")!,
+        address: 1,
+        portChain: Vector<u8>.create(),
+        vendorId: 0x1234,
+        productId: 0x5678,
+        deviceVersion: 0x0100,
+        usbVersion: 0x0200,
+        deviceClass: 0,
+        deviceSubclass: 0,
+        deviceProtocol: 0,
+        speed: Some(Speed.High),
+        manufacturer: null,
+        product: Some(String.from("Widget")!),
+        serialNumber: Some(String.from("SN1")!),
+        interfaces: interfaces,
+        path: String.create(),
+        busNumber: 250,
+        registryId: 0xFFFFFFFFFFFF,
+        port: 0,
+        parentId: null,
+        locationId: 0,
+        driver: null,
+    };
+}
+
+@test
+fn selectorsMatch() -> Result<void, TestFailure> {
+    let info = fakeInfo();
+    var s = DeviceSelector.any();
+    Check.isTrue(info.matches(borrow s), "any")?;
+    s.vendorId = Some(0x1234);
+    Check.isTrue(info.matches(borrow s), "vendor")?;
+    s.productId = Some(0x5678);
+    Check.isTrue(info.matches(borrow s), "vendor and product")?;
+    s.productId = Some(0x9999);
+    Check.isTrue(!info.matches(borrow s), "wrong product")?;
+    // The class triple matches the device's or an interface's: interface 0 is class 0xFF.
+    var c = DeviceSelector.any();
+    c.deviceClass = Some(0xFF);
+    Check.isTrue(info.matches(borrow c), "interface class")?;
+    c.deviceClass = Some(0x03);
+    Check.isTrue(!info.matches(borrow c), "other class")?;
+    var serial = DeviceSelector.any();
+    serial.serialNumber = Some(String.from("SN1")!);
+    Check.isTrue(info.matches(borrow serial), "serial")?;
+    serial.serialNumber = Some(String.from("SN2")!);
+    Check.isTrue(!info.matches(borrow serial), "other serial")?;
+    return Ok();
+}
+
+@test
+fn activeConfigurationOfAFakeDevice() -> Result<void, TestFailure> {
+    let config = CONFIG;
+    let device = Device.fake(config[..])!;
+    Check.equalU64(1, device.activeConfigurationValue() as u64)?;
+    let c = device.activeConfiguration()!;
+    Check.equalU64(1, c.interfaceCount() as u64)?;
+    let iface = device.claimInterface(0)!;
+    var alts = iface.altSettings();
+    var count: u64 = 0;
+    for (a in alts) {
+        count += 1;
+        Check.equalU64(0, a.number() as u64)?;
+    }
+    Check.equalU64(1, count)?;
+    return Ok();
+}
+
+@test
+fn aDeviceThatIsGoneDoesNotOpen() -> Result<void, TestFailure> {
+    // Bus 250, address 1 (Linux), an unused registry ID (macOS), an unknown instance (Windows).
+    let info = fakeInfo();
+    match (Usb.open(borrow info)) {
+        Ok(_) => {
+            return Check.fail("a device that is not there opened");
+        }
+        Err(e) => {
+            Check.isTrue(e.kind is ErrorKind.Disconnected || e.kind is ErrorKind.NotFound, "Disconnected")?;
+        }
+    }
+    return Ok();
+}
+
+@test
+fn errorsSayWhatAndCarryTheCode() -> Result<void, TestFailure> {
+    let e = UsbError.create(ErrorKind.Busy, Operation.ClaimInterface, 16);
+    var line = [0u8; 128];
+    var w = TextWriter.create(mut line[..]);
+    e.write(mut w);
+    Check.equalText(
+        "claiming the interface: in use by a kernel driver or another program (OS error 0x00000010)",
+        StringView.fromUtf8(w.written())!,
+    )?;
+    let t = transferError(TransferStatus.Disconnected, 19, Operation.Transfer);
+    Check.isTrue(t.kind is ErrorKind.Disconnected, "disconnected transfer")?;
+    Check.isTrue(t.code == 19, "errno kept")?;
+    return Ok();
+}
+
+@test
+fn openEndpointChecksTypeAndDirection() -> Result<void, TestFailure> {
+    let config = CONFIG;
+    let device = Device.fake(config[..])!;
+    let iface = device.claimInterface(0)!;
+    Check.isTrue(iface.openEndpointChecked(0x81, TransferType.Bulk, Direction.Out).isErr(), "wrong direction")?;
+    Check.isTrue(iface.openEndpointChecked(0x82, TransferType.Bulk, Direction.In).isErr(), "wrong type")?;
+    let ok = iface.openEndpointChecked(0x82, TransferType.Interrupt, Direction.In);
+    Check.isTrue(ok.isOk(), "interrupt IN")?;
+    return Ok();
+}
+
+@test
+fn aBlockingTransferThatTimesOutIsCancelled() -> Result<void, TestFailure> {
+    var ep = openFake(0x81, 4);
+    let start = Clock.monotonicNanos();
+    let c = ep.transfer(Buffer.create(512)!, 50)!;
+    let ms = (Clock.monotonicNanos() - start) / 1000000;
+    Check.isTrue(c.status is TransferStatus.Cancelled, "cancelled")?;
+    Check.isTrue(ms >= 45 && ms < 2000, "after the timeout")?;
+    Check.equalU64(0, ep.pending() as u64)?;
+    var into = [0u8; 512];
+    match (ep.read(mut into[..], 30)) {
+        Ok(_) => {
+            return Check.fail("a read with nothing to read succeeded");
+        }
+        Err(e) => {
+            Check.isTrue(e.kind is ErrorKind.TimedOut, "TimedOut")?;
+        }
+    }
+    return Ok();
+}
+
+@test
+fn submitEndAddsAZeroLengthPacket() -> Result<void, TestFailure> {
+    var ep = openFake(0x01, 8);
+    var writer = match (Writer.create(ep, 512, 4)) {
+        Ok(w) => w,
+        Err(_) => {
+            return Check.fail("writer");
+        }
+    };
+    var data = [1u8; 512];
+    // A whole packet: SubmitEnd follows it with a zero-length packet.
+    writer.write(data[..], 1000)!;
+    writer.submitEnd()!;
+    Check.equalU64(2, writer.endpoint().pending() as u64)?;
+    // Nothing buffered at all: SubmitEnd still ends the message with a zero-length packet.
+    writer.submitEnd()!;
+    Check.equalU64(3, writer.endpoint().pending() as u64)?;
+    // A short last transfer needs none.
+    writer.write(data[0..100], 1000)!;
+    writer.submitEnd()!;
+    Check.equalU64(4, writer.endpoint().pending() as u64)?;
+    return Ok();
+}
+
+@test
+fn droppingAReaderDrainsItsTransfers() -> Result<void, TestFailure> {
+    var ep = openFake(0x81, 8);
+    var reader = match (Reader.create(ep, 512, 4)) {
+        Ok(r) => r,
+        Err(_) => {
+            return Check.fail("reader");
+        }
+    };
+    reader.setTransfers(4)!;
+    Check.equalU64(4, reader.endpoint().pending() as u64)?;
+    let ring: borrow Ring = borrow reader.endpoint().ring;
+    let address = ring as *Ring as usize;
+    // Dropping the reader cancels and drains (the fake's cancel completes them) before the ring is freed; the test
+    // passing without a leak or a hang is the check.
+    let _ = reader;
+    Check.isTrue(address != 0, "ring existed")?;
+    return Ok();
+}

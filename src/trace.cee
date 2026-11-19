@@ -1,0 +1,102 @@
+// Diagnostics: one line per event to stderr, off unless asked for (the C# version's TraceSource "CosmoUsb").
+// CEEUSB_TRACE=error|warn|debug in the environment sets the level at the first trace; Trace.setLevel overrides it.
+// Lines are built on the stack (no allocation) and never carry transfer data.
+
+@header("usb_os.h")
+extern "C" {
+    @effects()
+    fn usb_trace_env_level() -> i32;
+    @effects()
+    fn usb_trace_write(line: *u8, length: usize);
+}
+
+/// How much is traced.
+public enum TraceLevel {
+    Off,
+    /// Failures the library cannot report to a caller (an event loop that stopped).
+    Error,
+    /// Failures and refusals (a failed submit, an IN length that is not whole packets, a WinUSB policy refused).
+    Warn,
+    /// Everything: devices skipped while enumerating, fallbacks (heap buffers when usbfs mapping fails), opens,
+    /// claims and their errors.
+    Debug,
+}
+
+/// 0 off, 1 error, 2 warn, 3 debug; 255 not yet read from the environment.
+static TRACE_LEVEL: AtomicU32 = AtomicU32.constant(255);
+
+/// Tracing control.
+public struct Trace {
+    /// Sets the trace level for the process.
+    public fn setLevel(level: TraceLevel) {
+        TRACE_LEVEL.store(levelCode(level));
+    }
+}
+
+fn levelCode(level: TraceLevel) -> u32 => match (level) {
+    TraceLevel.Off => 0,
+    TraceLevel.Error => 1,
+    TraceLevel.Warn => 2,
+    TraceLevel.Debug => 3,
+};
+
+/// Is `level` traced?
+/// Safety: getenv, read once.
+@effects()
+fn tracing(level: TraceLevel) -> bool {
+    var current = TRACE_LEVEL.loadWith(LoadOrdering.Relaxed);
+    if (current == 255) {
+        current = truncate<u32>(unsafe { usb_trace_env_level() });
+        TRACE_LEVEL.store(current);
+    }
+    return levelCode(level) <= current && current != 0;
+}
+
+fn levelTag(level: TraceLevel) -> StringView => match (level) {
+    TraceLevel.Off => "",
+    TraceLevel.Error => "error",
+    TraceLevel.Warn => "warn",
+    TraceLevel.Debug => "debug",
+};
+
+/// "ceeusb <level>: <what>[ <detail>][: <error>]\n" to stderr.
+/// Safety: the line is a local buffer, written whole.
+@effects()
+fn trace(level: TraceLevel, what: StringView, detail: StringView, error: UsbError?) {
+    if (!tracing(level)) {
+        return;
+    }
+    var line = [0u8; 512];
+    var w = TextWriter.create(mut line[..]);
+    w.text("ceeusb ");
+    w.text(levelTag(level));
+    w.text(": ");
+    w.text(what);
+    if (detail.length > 0) {
+        w.text(" ");
+        w.text(detail);
+    }
+    match (error) {
+        Some(e) => {
+            w.text(": ");
+            e.write(mut w);
+        }
+        null => {}
+    }
+    w.text("\n");
+    let bytes = w.written();
+    unsafe { usb_trace_write(bytes.ptr, bytes.length); }
+}
+
+/// A line with a number, for codes and lengths.
+/// Safety: as trace.
+@effects()
+fn traceNumber(level: TraceLevel, what: StringView, n: u64) {
+    if (!tracing(level)) {
+        return;
+    }
+    var digits = [0u8; 24];
+    var w = TextWriter.create(mut digits[..]);
+    w.decimal(n);
+    trace(level, what, StringView.fromUtf8(w.written()) ?? "", null);
+}

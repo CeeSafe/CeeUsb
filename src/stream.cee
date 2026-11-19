@@ -1,0 +1,433 @@
+// Buffered streams over an endpoint: Reader for IN, Writer for OUT, keeping `transfers` transfers in flight so
+// the host controller never waits for the program.
+//
+// Against the C# UsbEndpointReader/Writer: completed buffers go to a free list and are reused, so a stream
+// allocates (on Linux: maps) its buffers once. The C# writer disposed every completed buffer while a write buffer
+// was active, which with two or more transfers in flight is nearly always, and allocated (mmap'd) a new one per
+// transfer.
+
+/// Reads an IN endpoint as a byte stream. Data arriving in packets is handed out across `read` calls as asked;
+/// a transfer error is reported once the data before it has been read.
+public struct Reader {
+    ep: Endpoint;
+    size: usize;
+    transfers: usize;
+    current: Buffer?;
+    position: usize;
+    failed: TransferStatus?;
+    failedCode: i32;
+    free: Vector<Buffer>;
+
+    /// A reader of `transferSize`-byte transfers (rounded up to whole packets), `transfers` in flight (at least 1;
+    /// 2 or more for continuous streaming).
+    public fn create(endpoint: Endpoint, transferSize: usize, transfers: usize) -> Result<Reader, Endpoint> {
+        if (!(endpoint.direction() is Direction.In)) {
+            return Err(endpoint);
+        }
+        let packet = endpoint.maxPacketSize();
+        let packets = (transferSize + packet - 1) / packet;
+        let size = (if (packets == 0) 1 else packets) * packet;
+        let room = endpoint.capacity();
+        let n = if (transfers == 0) 1 else if (transfers > room) room else transfers;
+        return Ok(
+            Reader {
+                ep: endpoint,
+                size: size,
+                transfers: n,
+                current: null,
+                position: 0,
+                failed: null,
+                failedCode: 0,
+                free: Vector<Buffer>.create(),
+            },
+        );
+    }
+
+    /// The endpoint.
+    public fn endpoint(borrow mut this) -> borrow mut Endpoint => borrow mut this.ep;
+
+    /// Reads into `into`; the bytes read, at least 1 unless `into` is empty. Waits up to `timeoutMs` for data
+    /// (0: no limit): a timeout is `Err(TimedOut)` and leaves the transfers queued.
+    public fn read(borrow mut this, into: SliceMut<u8>, timeoutMs: u64) -> Result<usize, UsbError> {
+        loop {
+            match (this.buffered(into)) {
+                Some(r) => {
+                    return r;
+                }
+                null => {}
+            }
+            this.fill()?;
+            match (this.ep.waitComplete(timeoutMs)) {
+                Some(c) => {
+                    this.accept(c);
+                }
+                null => {
+                    return Err(UsbError.create(ErrorKind.TimedOut, Operation.Transfer, 0));
+                }
+            }
+        }
+    }
+
+    /// Reads into `into`, waiting as a task.
+    public async fn readAsync(borrow mut this, into: SliceMut<u8>) -> Result<usize, UsbError> {
+        loop {
+            match (this.buffered(into)) {
+                Some(r) => {
+                    return r;
+                }
+                null => {}
+            }
+            this.fill()?;
+            match (await this.ep.nextComplete()) {
+                Ok(c) => {
+                    this.accept(c);
+                }
+                Err(_) => {
+                    return Err(UsbError.create(ErrorKind.Cancelled, Operation.Transfer, 0));
+                }
+            }
+        }
+    }
+
+    /// Reads one message: transfers until one ends short (a short or zero-length packet), appended to `out`.
+    /// Requires no partly read data.
+    public fn readMessage(borrow mut this, out: borrow mut Vector<u8>, timeoutMs: u64) -> Result<void, UsbError> {
+        if (this.current.isSome()) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.Transfer, 0));
+        }
+        loop {
+            this.fill()?;
+            let c = match (this.ep.waitComplete(timeoutMs)) {
+                Some(c) => c,
+                null => {
+                    return Err(UsbError.create(ErrorKind.TimedOut, Operation.Transfer, 0));
+                }
+            };
+            let short = c.actualLength < c.buffer.requested();
+            let status = c.status;
+            let code = c.code;
+            let appended = out.extend(c.buffer.view());
+            this.recycle(c.buffer);
+            if (!(status is TransferStatus.Success)) {
+                return Err(transferError(status, code, Operation.Transfer));
+            }
+            if (appended.isErr()) {
+                return Err(UsbError.noMemory(Operation.Transfer));
+            }
+            if (short) {
+                return Ok();
+            }
+        }
+    }
+
+    /// `readMessage`, waiting as a task.
+    public async fn readMessageAsync(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, UsbError> {
+        if (this.current.isSome()) {
+            return Err(UsbError.create(ErrorKind.Busy, Operation.Transfer, 0));
+        }
+        loop {
+            this.fill()?;
+            let c = match (await this.ep.nextComplete()) {
+                Ok(c) => c,
+                Err(_) => {
+                    return Err(UsbError.create(ErrorKind.Cancelled, Operation.Transfer, 0));
+                }
+            };
+            let short = c.actualLength < c.buffer.requested();
+            let status = c.status;
+            let code = c.code;
+            let appended = out.extend(c.buffer.view());
+            this.recycle(c.buffer);
+            if (!(status is TransferStatus.Success)) {
+                return Err(transferError(status, code, Operation.Transfer));
+            }
+            if (appended.isErr()) {
+                return Err(UsbError.noMemory(Operation.Transfer));
+            }
+            if (short) {
+                return Ok();
+            }
+        }
+    }
+
+    /// How many transfers the reader keeps in flight.
+    public fn inFlightTarget(borrow this) -> usize => this.transfers;
+
+    /// Changes how many transfers the reader keeps in flight (capped at the endpoint's ring), submitting more at
+    /// once; 0 stops resubmitting, so the stream ends after what is in flight.
+    public fn setTransfers(borrow mut this, n: usize) -> Result<void, UsbError> {
+        let room = this.ep.capacity();
+        this.transfers = if (n > room) room else n;
+        return this.fill();
+    }
+
+    /// Stops the stream: cancels what is in flight. Reads then return what had arrived, then nothing.
+    public fn cancelAll(borrow mut this) {
+        this.transfers = 0;
+        this.ep.cancelAll();
+    }
+
+    /// The buffered data's next bytes, or the deferred error, or null when there is nothing to hand out.
+    fn buffered(borrow mut this, into: SliceMut<u8>) -> Result<usize, UsbError>? {
+        match (borrow mut this.current) {
+            Some(b) => {
+                let available = b.length() - this.position;
+                if (available > 0) {
+                    let n = if (available < into.length) available else into.length;
+                    into[0..n].copyFrom(b.view()[this.position..this.position + n]);
+                    this.position += n;
+                    if (this.position < b.length()) {
+                        return Some(Ok(n));
+                    }
+                    let done = replace(mut this.current, null)!;
+                    this.position = 0;
+                    this.recycle(done);
+                    return Some(Ok(n));
+                }
+            }
+            null => {}
+        }
+        match (replace(mut this.failed, null)) {
+            Some(status) => {
+                return Some(Err(transferError(status, this.failedCode, Operation.Transfer)));
+            }
+            null => {}
+        }
+        if (this.transfers == 0 && this.ep.pending() == 0) {
+            return Some(Ok(0));
+        }
+        return null;
+    }
+
+    /// Keeps `transfers` transfers in flight, reusing free buffers.
+    fn fill(borrow mut this) -> Result<void, UsbError> {
+        while (this.ep.pending() < this.transfers) {
+            var b = match (this.free.pop()) {
+                Some(b) => b,
+                null => this.ep.allocate(this.size)?,
+            };
+            b.clear();
+            b.setRequested(this.size);
+            if (this.ep.submit(b).isErr()) {
+                break;
+            }
+        }
+        return Ok();
+    }
+
+    fn accept(borrow mut this, c: Completion) {
+        if (!(c.status is TransferStatus.Success) && !(c.status is TransferStatus.Cancelled)) {
+            this.failed = Some(c.status);
+            this.failedCode = c.code;
+        }
+        if (c.actualLength > 0) {
+            this.current = Some(c.buffer);
+            this.position = 0;
+        } else {
+            this.recycle(c.buffer);
+        }
+    }
+
+    fn recycle(borrow mut this, b: Buffer) {
+        // A failed push drops the buffer: it is only a cache.
+        let _ = this.free.push(b);
+    }
+}
+
+/// Writes an OUT endpoint as a byte stream, in `transferSize`-byte transfers with `transfers` in flight.
+public struct Writer {
+    ep: Endpoint;
+    size: usize;
+    transfers: usize;
+    writing: Buffer?;
+    free: Vector<Buffer>;
+
+    public fn create(endpoint: Endpoint, transferSize: usize, transfers: usize) -> Result<Writer, Endpoint> {
+        if (!(endpoint.direction() is Direction.Out)) {
+            return Err(endpoint);
+        }
+        let packet = endpoint.maxPacketSize();
+        let packets = (transferSize + packet - 1) / packet;
+        let size = (if (packets == 0) 1 else packets) * packet;
+        let room = endpoint.capacity();
+        let n = if (transfers == 0) 1 else if (transfers > room) room else transfers;
+        return Ok(Writer { ep: endpoint, size: size, transfers: n, writing: null, free: Vector<Buffer>.create() });
+    }
+
+    public fn endpoint(borrow mut this) -> borrow mut Endpoint => borrow mut this.ep;
+
+    /// Queues `data`, submitting each transfer as it fills; waits (up to `timeoutMs` per completion, 0: no limit)
+    /// only when `transfers` are already in flight.
+    public fn write(borrow mut this, data: Slice<u8>, timeoutMs: u64) -> Result<void, UsbError> {
+        var rest = data;
+        while (rest.length > 0) {
+            while (this.ep.pending() >= this.transfers) {
+                this.reap(timeoutMs)?;
+            }
+            let taken = this.append(rest)?;
+            rest = rest[taken..];
+        }
+        return Ok();
+    }
+
+    /// Queues `data`, waiting as a task.
+    public async fn writeAsync(borrow mut this, data: Slice<u8>) -> Result<void, UsbError> {
+        var rest = data;
+        while (rest.length > 0) {
+            while (this.ep.pending() >= this.transfers) {
+                match (await this.ep.nextComplete()) {
+                    Ok(c) => {
+                        this.handle(c)?;
+                    }
+                    Err(_) => {
+                        return Err(UsbError.create(ErrorKind.Cancelled, Operation.Transfer, 0));
+                    }
+                }
+            }
+            let taken = this.append(rest)?;
+            rest = rest[taken..];
+        }
+        return Ok();
+    }
+
+    /// Submits the partly filled transfer, if any.
+    public fn submit(borrow mut this) {
+        match (replace(mut this.writing, null)) {
+            Some(b) => {
+                if (b.length() == 0) {
+                    this.writing = Some(b);
+                    return;
+                }
+                match (this.ep.submit(b)) {
+                    Ok() => {}
+                    Err(back) => {
+                        this.writing = Some(back);
+                    }
+                }
+            }
+            null => {}
+        }
+    }
+
+    /// Submits what is buffered and ends the message: when its length is a whole number of packets, a zero-length
+    /// packet follows, so the device sees the end.
+    public fn submitEnd(borrow mut this) -> Result<void, UsbError> {
+        let length = match (borrow this.writing) {
+            Some(b) => b.length(),
+            null => 0,
+        };
+        this.submit();
+        if (length % this.ep.maxPacketSize() == 0) {
+            var zlp = match (this.free.pop()) {
+                Some(b) => b,
+                null => this.ep.allocate(0)?,
+            };
+            zlp.clear();
+            if (this.ep.submit(zlp).isErr()) {
+                return Err(UsbError.create(ErrorKind.Busy, Operation.Transfer, 0));
+            }
+        }
+        return Ok();
+    }
+
+    /// How many transfers the writer keeps in flight.
+    public fn inFlightTarget(borrow this) -> usize => this.transfers;
+
+    /// Changes how many transfers the writer may keep in flight (1 to the endpoint's ring).
+    public fn setTransfers(borrow mut this, n: usize) {
+        let room = this.ep.capacity();
+        this.transfers = if (n == 0) 1 else if (n > room) room else n;
+    }
+
+    /// `flush`, waiting as a task.
+    public async fn flushAsync(borrow mut this) -> Result<void, UsbError> {
+        this.submit();
+        return await this.drainAsync();
+    }
+
+    /// `flushEnd`, waiting as a task.
+    public async fn flushEndAsync(borrow mut this) -> Result<void, UsbError> {
+        this.submitEnd()?;
+        return await this.drainAsync();
+    }
+
+    async fn drainAsync(borrow mut this) -> Result<void, UsbError> {
+        while (this.ep.pending() > 0) {
+            match (await this.ep.nextComplete()) {
+                Ok(c) => {
+                    this.handle(c)?;
+                }
+                Err(_) => {
+                    return Err(UsbError.create(ErrorKind.Cancelled, Operation.Transfer, 0));
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// Submits what is buffered and waits for every transfer.
+    public fn flush(borrow mut this, timeoutMs: u64) -> Result<void, UsbError> {
+        this.submit();
+        while (this.ep.pending() > 0) {
+            this.reap(timeoutMs)?;
+        }
+        return Ok();
+    }
+
+    /// `submitEnd`, then waits for every transfer.
+    public fn flushEnd(borrow mut this, timeoutMs: u64) -> Result<void, UsbError> {
+        this.submitEnd()?;
+        while (this.ep.pending() > 0) {
+            this.reap(timeoutMs)?;
+        }
+        return Ok();
+    }
+
+    /// Copies as much of `data` as fits into the current transfer; submits it when full. The bytes taken.
+    fn append(borrow mut this, data: Slice<u8>) -> Result<usize, UsbError> {
+        if (this.writing.isNull()) {
+            var b = match (this.free.pop()) {
+                Some(b) => b,
+                null => this.ep.allocate(this.size)?,
+            };
+            b.clear();
+            this.writing = Some(b);
+        }
+        var full = false;
+        var n: usize = 0;
+        match (borrow mut this.writing) {
+            Some(b) => {
+                let room = b.size() - b.length();
+                n = if (data.length < room) data.length else room;
+                b.append(data[0..n]);
+                full = b.length() == b.size();
+            }
+            null => {}
+        }
+        if (full) {
+            this.submit();
+        }
+        return Ok(n);
+    }
+
+    fn reap(borrow mut this, timeoutMs: u64) -> Result<void, UsbError> {
+        match (this.ep.waitComplete(timeoutMs)) {
+            Some(c) => {
+                return this.handle(c);
+            }
+            null => {
+                return Err(UsbError.create(ErrorKind.TimedOut, Operation.Transfer, 0));
+            }
+        }
+    }
+
+    fn handle(borrow mut this, c: Completion) -> Result<void, UsbError> {
+        let status = c.status;
+        let code = c.code;
+        let _ = this.free.push(c.buffer);
+        if (status is TransferStatus.Success) {
+            return Ok();
+        }
+        return Err(transferError(status, code, Operation.Transfer));
+    }
+}

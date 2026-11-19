@@ -1,0 +1,220 @@
+// What enumeration reports about a device, from the OS's cache: no device I/O and no open.
+
+/// A device's identity for as long as it stays connected (bus and address on Linux, the registry entry ID on
+/// macOS, a hash of the instance ID on Windows). Hotplug removal events carry only this.
+public struct DeviceId {
+    public value: u64;
+
+    public fn equals(borrow this, other: DeviceId) -> bool => this.value == other.value;
+}
+
+/// One interface of a device's active configuration, as enumeration saw it.
+public struct InterfaceInfo {
+    public number: u8;
+    public interfaceClass: u8;
+    public interfaceSubclass: u8;
+    public interfaceProtocol: u8;
+    /// The interface's string, when the OS cached it.
+    public name: String?;
+}
+
+/// A connected device, as the OS's cache describes it.
+public struct DeviceInfo {
+    public id: DeviceId;
+    /// The bus: Linux's bus number ("001"), macOS's location ID's top byte, Windows's controller instance.
+    public busId: String;
+    public address: u8;
+    /// The hub ports from the root hub down to the device.
+    public portChain: Vector<u8>;
+    public vendorId: u16;
+    public productId: u16;
+    public deviceVersion: u16;
+    public usbVersion: u16;
+    public deviceClass: u8;
+    public deviceSubclass: u8;
+    public deviceProtocol: u8;
+    public speed: Speed?;
+    public manufacturer: String?;
+    public product: String?;
+    public serialNumber: String?;
+    public interfaces: Vector<InterfaceInfo>;
+
+    /// Linux: the sysfs directory. macOS: unused. Windows: the device instance ID.
+    public path: String;
+    /// Linux: the bus number.
+    public busNumber: u8;
+    /// macOS: the IORegistry entry ID.
+    public registryId: u64;
+    /// The port of the parent hub the device is plugged into (the last of `portChain` on Linux and macOS; the
+    /// hub driver's port number on Windows); 0 when unknown.
+    public port: u32;
+    /// Windows: the parent's device instance ID.
+    public parentId: String?;
+    /// macOS: the location ID.
+    public locationId: u32;
+    /// Windows: the bound driver's service name ("WinUSB").
+    public driver: String?;
+
+    /// Does this device match `selector`? Every field the selector sets must match; the class triple matches the
+    /// device's or any interface's.
+    public fn matches(borrow this, selector: borrow DeviceSelector) -> bool {
+        if (selector.vendorId is Some(v)) {
+            if (v != this.vendorId) {
+                return false;
+            }
+        }
+        if (selector.productId is Some(p)) {
+            if (p != this.productId) {
+                return false;
+            }
+        }
+        if (borrow selector.serialNumber is Some(wanted)) {
+            match (borrow this.serialNumber) {
+                Some(s) => {
+                    if (s.view() != wanted.view()) {
+                        return false;
+                    }
+                }
+                null => {
+                    return false;
+                }
+            }
+        }
+        if (selector.classMatches(this.deviceClass, this.deviceSubclass, this.deviceProtocol)) {
+            return true;
+        }
+        for (i in this.interfaces.view()) {
+            if (selector.classMatches(i.interfaceClass, i.interfaceSubclass, i.interfaceProtocol)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// "VVVV:PPPP product" into `w`.
+    public fn write<region r>(borrow this, w: borrow mut TextWriter<r>) {
+        w.hex(this.vendorId as u64, 4);
+        w.text(":");
+        w.hex(this.productId as u64, 4);
+        w.text(" ");
+        match (borrow this.product) {
+            Some(p) => {
+                w.text(p.view());
+            }
+            null => {
+                w.text("(unknown)");
+            }
+        }
+    }
+}
+
+/// What to look for in `Usb.findDevice`; a field left null matches anything.
+public struct DeviceSelector {
+    public vendorId: u16?;
+    public productId: u16?;
+    public deviceClass: u8?;
+    public deviceSubclass: u8?;
+    public deviceProtocol: u8?;
+    public serialNumber: String?;
+
+    /// Matches every device.
+    public fn any() -> DeviceSelector =>
+        DeviceSelector {
+            vendorId: null,
+            productId: null,
+            deviceClass: null,
+            deviceSubclass: null,
+            deviceProtocol: null,
+            serialNumber: null,
+        };
+
+    /// Matches a vendor and product ID.
+    public fn ids(vendorId: u16, productId: u16) -> DeviceSelector =>
+        DeviceSelector {
+            vendorId: Some(vendorId),
+            productId: Some(productId),
+            deviceClass: null,
+            deviceSubclass: null,
+            deviceProtocol: null,
+            serialNumber: null,
+        };
+
+    fn classMatches(borrow this, c: u8, s: u8, p: u8) -> bool {
+        if (this.deviceClass is Some(x)) {
+            if (x != c) {
+                return false;
+            }
+        }
+        if (this.deviceSubclass is Some(x)) {
+            if (x != s) {
+                return false;
+            }
+        }
+        if (this.deviceProtocol is Some(x)) {
+            if (x != p) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+/// The kind of host controller, from its driver's name.
+public enum ControllerType {
+    Xhci,
+    Ehci,
+    Ohci,
+    Uhci,
+    Vhci,
+}
+
+/// The controller type a driver or class name names ("xhci_hcd", "AppleUSBXHCI", "USBXHCI"), if any.
+public fn controllerTypeFromName(name: StringView) -> ControllerType? {
+    let bytes = name.bytes();
+    var i: usize = 1;
+    while (i + 2 < bytes.length) {
+        if (lower(bytes[i]) == 'h' && lower(bytes[i + 1]) == 'c' && lower(bytes[i + 2]) == 'i') {
+            return match (lower(bytes[i - 1])) {
+                'x' => Some(ControllerType.Xhci),
+                'e' => Some(ControllerType.Ehci),
+                'o' => Some(ControllerType.Ohci),
+                'u' => Some(ControllerType.Uhci),
+                'v' => Some(ControllerType.Vhci),
+                _ => null,
+            };
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn lower(b: u8) -> u8 => if (b >= 'A' && b <= 'Z') b + 32 else b;
+
+/// A host controller (a bus).
+public struct BusInfo {
+    public busId: String;
+    public controllerType: ControllerType?;
+    public driver: String?;
+    public name: String?;
+    /// Linux: the root hub's sysfs path. Windows: the controller's instance ID.
+    public path: String;
+    /// macOS: the registry entry ID.
+    public registryId: u64;
+    /// macOS: the location ID.
+    public locationId: u32;
+}
+
+/// A change to the set of connected devices.
+public enum HotplugEvent {
+    Arrived(DeviceInfo),
+    Left(DeviceId),
+}
+
+/// An optional copy of `text`, or null when empty.
+fn optionalString(text: StringView) -> Result<String?, AllocError> {
+    let t = text.trim();
+    if (t.length == 0) {
+        return Ok(null);
+    }
+    return Ok(Some(String.from(t)?));
+}

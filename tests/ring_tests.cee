@@ -1,0 +1,194 @@
+// The transfer ring, without hardware: a fake device's endpoints leave submitted slots PENDING, and the tests play
+// the OS, completing them (from other threads, out of order) with completeSlot, as the event loops do.
+
+/// One configuration: interface 0 with bulk OUT 0x01, bulk IN 0x81 (512-byte packets) and interrupt IN 0x82 (64).
+const CONFIG: [u8; 39] = [
+    9, 2, 39, 0, 1, 1, 0, 0x80, 50,
+    9, 4, 0, 0, 3, 0xFF, 0, 0, 0,
+    7, 5, 0x01, 2, 0x00, 0x02, 0,
+    7, 5, 0x81, 2, 0x00, 0x02, 0,
+    7, 5, 0x82, 3, 64, 0, 1,
+];
+
+fn openFake(address: u8, ring: usize) -> Endpoint {
+    let config = CONFIG;
+    let device = Device.fake(config[..])!;
+    let iface = device.claimInterface(0)!;
+    return iface.openEndpointWith(address, ring)!;
+}
+
+/// The address of slot `index`, for a thread that plays the OS.
+fn slotAddress(ep: borrow mut Endpoint, index: usize) -> usize => borrow mut ep.ring.slots[index] as *mut Slot as usize;
+
+/// Safety: the address is a PENDING slot of a live ring (the test keeps the endpoint until it is taken).
+fn complete(address: usize, actual: usize) {
+    unsafe { completeSlot(address as *mut Slot, TransferStatus.Success, actual, 0); }
+}
+
+@test
+fn opensOnlyRealEndpoints() -> Result<void, TestFailure> {
+    let config = CONFIG;
+    let device = Device.fake(config[..])!;
+    let iface = device.claimInterface(0)!;
+    Check.isTrue(device.claimInterface(0).isErr(), "a second claim is Busy")?;
+    let ep = iface.openEndpoint(0x81)!;
+    Check.equalU64(512, ep.maxPacketSize() as u64)?;
+    Check.isTrue(ep.transferType() is TransferType.Bulk, "bulk")?;
+    Check.isTrue(iface.openEndpoint(0x81).isErr(), "a second open is Busy")?;
+    Check.isTrue(iface.openEndpoint(0x03).isErr(), "no such endpoint")?;
+    Check.isTrue(iface.setAltSetting(0).isErr(), "alt setting change while open is Busy")?;
+    let irq = iface.openEndpoint(0x82)!;
+    Check.isTrue(irq.transferType() is TransferType.Interrupt, "interrupt")?;
+    return Ok();
+}
+
+@test
+fn completionsComeInSubmissionOrder() -> Result<void, TestFailure> {
+    var ep = openFake(0x01, 8);
+    for (i in 0..4u8) {
+        let b = Buffer.from([i, i, i][..])!;
+        Check.isTrue(ep.submit(b).isOk(), "submitted")?;
+    }
+    Check.equalU64(4, ep.pending() as u64)?;
+    let s0 = slotAddress(mut ep, 0);
+    let s1 = slotAddress(mut ep, 1);
+    let s2 = slotAddress(mut ep, 2);
+    let s3 = slotAddress(mut ep, 3);
+    // The OS finishes 3 and 1 first: nothing can be taken until 0 is done.
+    complete(s3, 3);
+    complete(s1, 1);
+    Check.isTrue(ep.tryComplete().isNull(), "head not done")?;
+    complete(s0, 0);
+    let c0 = ep.tryComplete()!;
+    Check.equalU64(0, c0.buffer.view()[0] as u64)?;
+    let c1 = ep.tryComplete()!;
+    Check.equalU64(1, c1.buffer.view()[0] as u64)?;
+    Check.isTrue(ep.tryComplete().isNull(), "2 still pending")?;
+    complete(s2, 2);
+    let c2 = ep.tryComplete()!;
+    Check.equalU64(2, c2.buffer.view()[0] as u64)?;
+    let c3 = ep.tryComplete()!;
+    Check.equalU64(3, c3.buffer.view()[0] as u64)?;
+    Check.equalU64(0, ep.pending() as u64)?;
+    return Ok();
+}
+
+@test
+fn fullRingGivesTheBufferBack() -> Result<void, TestFailure> {
+    var ep = openFake(0x01, 2);
+    Check.isTrue(ep.submit(Buffer.create(8)!).isOk(), "1")?;
+    Check.isTrue(ep.submit(Buffer.create(8)!).isOk(), "2")?;
+    match (ep.submit(Buffer.create(16)!)) {
+        Ok() => {
+            return Check.fail("a full ring accepted a third transfer");
+        }
+        Err(b) => {
+            Check.equalU64(16, b.size() as u64)?;
+        }
+    }
+    complete(slotAddress(mut ep, 0), 8);
+    complete(slotAddress(mut ep, 1), 8);
+    return Ok();
+}
+
+@test
+fn inLengthMustBeWholePackets() -> Result<void, TestFailure> {
+    var ep = openFake(0x81, 4);
+    var b = Buffer.create(1024)!;
+    b.setRequested(100);
+    ep.submit(b)!;
+    let c = ep.tryComplete()!;
+    Check.isTrue(c.status is TransferStatus.InvalidArgument, "not a multiple of 512")?;
+    var good = c.buffer;
+    good.setRequested(1024);
+    ep.submit(good)!;
+    complete(slotAddress(mut ep, 1), 700);
+    let ok = ep.tryComplete()!;
+    Check.isTrue(ok.isSuccess(), "ok")?;
+    Check.equalU64(700, ok.buffer.length() as u64)?;
+    Check.equalU64(1024, ok.buffer.requested() as u64)?;
+    return Ok();
+}
+
+@test
+fn waitWakesAcrossThreadsAndTimesOut() -> Result<void, TestFailure> {
+    var ep = openFake(0x81, 4);
+    ep.submit(Buffer.create(512)!)!;
+    Check.isTrue(ep.waitComplete(20).isNull(), "times out while pending")?;
+    let address = slotAddress(mut ep, 0);
+    let os = Thread.spawn(move () => {
+        let _ = Async.run(Timer.sleep(30));
+        complete(address, 512);
+    })!;
+    let c = ep.waitComplete(5000)!;
+    Check.equalU64(512, c.actualLength as u64)?;
+    os.join();
+    return Ok();
+}
+
+async fn nextOf(ep: borrow mut Endpoint) -> Result<usize, AsyncError> {
+    let c = await ep.nextComplete()?;
+    return Ok(c.actualLength);
+}
+
+@test
+fn asyncWaitWakes() -> Result<void, TestFailure> {
+    var ep = openFake(0x81, 4);
+    ep.submit(Buffer.create(512)!)!;
+    let address = slotAddress(mut ep, 0);
+    let os = Thread.spawn(move () => {
+        let _ = Async.run(Timer.sleep(10));
+        complete(address, 77);
+    })!;
+    Check.equalU64(77, Async.run(nextOf(mut ep))! as u64)?;
+    os.join();
+    Check.isTrue(Async.run(nextOf(mut ep)).isErr(), "nothing pending is Closed")?;
+    return Ok();
+}
+
+/// A stream through the ring: a completer thread plays the event loop, finishing each slot as soon as it is
+/// pending; the main thread keeps the ring full and takes completions in order. Measures the ring's own cost per
+/// transfer (submit, complete, wake, take) with no OS call.
+/// Safety: the slot addresses belong to `ep`, which outlives the completer thread (joined before return).
+@test
+fn streamThroughTheRing() -> Result<void, TestFailure> {
+    let count: u64 = 200000;
+    let depth: usize = 8;
+    var ep = openFake(0x81, depth);
+    var addresses = Vector<usize>.create();
+    for (i in 0..depth) {
+        addresses.push(slotAddress(mut ep, i))!;
+    }
+    let os = Thread.spawn(move () => {
+        var next: usize = 0;
+        var done: u64 = 0;
+        while (done < count) {
+            let slot = unsafe { Ptr.toBorrow(addresses[next] as *Slot) };
+            if (slot.state.loadWith(LoadOrdering.Acquire) == SLOT_PENDING) {
+                complete(addresses[next], 512);
+                next = (next + 1) % addresses.length;
+                done += 1;
+            }
+        }
+    })!;
+    let start = Clock.monotonicNanos();
+    for (k in 0..depth) {
+        ep.submit(Buffer.create(512)!)!;
+    }
+    var taken: u64 = 0;
+    var submitted: u64 = depth as u64;
+    while (taken < count) {
+        let c = ep.waitComplete(5000)!;
+        taken += 1;
+        if (submitted < count) {
+            ep.submit(c.buffer)!;
+            submitted += 1;
+        }
+    }
+    let ns = Clock.monotonicNanos() - start;
+    os.join();
+    Console.write("ring: ");
+    Console.write(ns / count);
+    Console.writeLine(" ns per transfer (submit + complete + wake + take), no allocation");
+    return Ok();
+}

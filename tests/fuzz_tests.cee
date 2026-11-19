@@ -1,0 +1,129 @@
+// Descriptor fuzzing, ported from the C# DescriptorFuzzTests: random and descriptor-shaped random buffers walked
+// through every parser and accessor. In CeeSafe an out-of-bounds read panics, so "never throws" becomes "never
+// panics": a test fails if any walk reads outside its slice.
+
+struct Rng {
+    state: u64;
+
+    fn next(borrow mut this) -> u64 {
+        var x = this.state;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        this.state = x;
+        return x;
+    }
+
+    fn below(borrow mut this, n: u64) -> u64 => if (n == 0) 0 else this.next() % n;
+}
+
+fn walkConfig(c: ConfigurationDescriptor) -> u64 {
+    var seen: u64 =
+        c.interfaceCount() as u64 +
+            c.value() as u64 + c.stringIndex() as u64 + c.attributes() as u64 + c.maxPower() as u64;
+    var ds = c.descriptors();
+    for (d in ds) {
+        seen += d.descriptorType() as u64;
+    }
+    var groups = c.interfaces();
+    for (g in groups) {
+        seen += g.number as u64;
+        seen += g.first().altSetting() as u64;
+        var alts = g.altSettings();
+        for (alt in alts) {
+            seen +=
+                alt.altSetting() as u64 +
+                    alt.interfaceClass() as u64 + alt.stringIndex() as u64 + alt.endpointCount() as u64;
+            var inner = alt.descriptors();
+            for (d in inner) {
+                seen += d.descriptorType() as u64;
+            }
+            var eps = alt.endpoints();
+            for (ep in eps) {
+                seen +=
+                    ep.address() as u64 +
+                        ep.maxPacketSize() as u64 + ep.packetsPerMicroframe() as u64 + ep.interval() as u64;
+                seen += transferTypeCode(ep.transferType()) as u64;
+                var companions = ep.descriptors();
+                for (d in companions) {
+                    seen += d.descriptorType() as u64;
+                }
+            }
+        }
+    }
+    let _ = c.findAltSetting(0, 0);
+    return seen;
+}
+
+fn walkEverything(data: Slice<u8>) -> u64 {
+    var seen: u64 = 0;
+    var configs = ConfigurationIter.over(data);
+    for (c in configs) {
+        seen += walkConfig(c);
+    }
+    // Unchecked wrapping of raw data, as a backend may hand an OS buffer straight to a view.
+    if (data.length >= 9) {
+        seen += walkConfig(ConfigurationDescriptor { bytes: data });
+    }
+    match (DeviceDescriptor.parse(data)) {
+        Some(d) => {
+            seen += d.vendorId() as u64;
+        }
+        null => {}
+    }
+    var s = String.create();
+    let _ = decodeStringDescriptor(data, mut s);
+    var langs = Vector<u16>.create();
+    let _ = decodeLanguageIds(data, mut langs);
+    var all = DescriptorIter.over(data);
+    for (d in all) {
+        seen += d.bytes.length as u64 + d.descriptorType() as u64;
+    }
+    return seen;
+}
+
+@test
+fn randomBuffersNeverPanic() -> Result<void, TestFailure> {
+    var rng = Rng { state: 0x5eed };
+    var data = Vector<u8>.create();
+    for (i in 0..5000) {
+        data.clear();
+        let n = rng.below(512);
+        for (k in 0..n) {
+            data.push(truncate<u8>(rng.next()))!;
+        }
+        let _ = walkEverything(data.view());
+    }
+    return Ok();
+}
+
+@test
+fn structuredRandomBuffersNeverPanic() -> Result<void, TestFailure> {
+    // Descriptor-shaped data: plausible bLength and bDescriptorType, so parsing goes deeper than noise does.
+    var rng = Rng { state: 0xf00d };
+    let types = [0x01u8, 0x02, 0x04, 0x05, 0x03, 0x0b, 0x24, 0x25, 0x30, 0xff];
+    var data = Vector<u8>.create();
+    for (i in 0..5000) {
+        data.clear();
+        let descriptors = rng.below(24);
+        for (d in 0..descriptors) {
+            let length = rng.below(32);
+            let kind = types[rng.below(types.length as u64) as usize];
+            data.push(truncate<u8>(length))!;
+            data.push(kind)!;
+            var k: u64 = 2;
+            while (k < length) {
+                data.push(truncate<u8>(rng.next()))!;
+                k += 1;
+            }
+        }
+        // Sometimes a valid configuration header, with a total length that may lie.
+        if (rng.below(2) == 0 && data.length >= 9) {
+            data[0] = 9;
+            data[1] = DESCRIPTOR_CONFIGURATION;
+            data.writeLE(2, truncate<u16>(rng.below(data.length as u64 + 16)));
+        }
+        let _ = walkEverything(data.view());
+    }
+    return Ok();
+}

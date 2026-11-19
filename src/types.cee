@@ -1,0 +1,165 @@
+// The small value types of the API: speeds, directions, transfer types and control requests.
+
+/// The connection speed of a device.
+public enum Speed {
+    /// 1.5 Mbit/s
+    Low,
+    /// 12 Mbit/s
+    Full,
+    /// 480 Mbit/s
+    High,
+    /// 5 Gbit/s
+    Super,
+    /// 10 Gbit/s or more
+    SuperPlus,
+}
+
+/// The words for a Speed.
+public fn speedText(speed: Speed) -> StringView => match (speed) {
+    Speed.Low => "low (1.5 Mbit/s)",
+    Speed.Full => "full (12 Mbit/s)",
+    Speed.High => "high (480 Mbit/s)",
+    Speed.Super => "super (5 Gbit/s)",
+    Speed.SuperPlus => "super+ (10 Gbit/s)",
+};
+
+/// Parses Linux sysfs's speed (`1.5`, `12`, `480`, `5000`, `10000`, `20000`) or nusb's names.
+public fn speedFromText(text: StringView) -> Speed? {
+    let t = text.trim();
+    if (t == "1.5" || t == "low") {
+        return Some(Speed.Low);
+    }
+    if (t == "12" || t == "full") {
+        return Some(Speed.Full);
+    }
+    if (t == "480" || t == "high") {
+        return Some(Speed.High);
+    }
+    if (t == "5000" || t == "super") {
+        return Some(Speed.Super);
+    }
+    if (t == "10000" || t == "20000" || t == "super+") {
+        return Some(Speed.SuperPlus);
+    }
+    return null;
+}
+
+/// The direction of a transfer, seen from the host. Its value is bit 7 of an endpoint address.
+public enum Direction {
+    Out,
+    In,
+}
+
+/// The direction an endpoint address encodes.
+public fn directionOf(address: u8) -> Direction => if ((address & 0x80) != 0) Direction.In else Direction.Out;
+
+/// An endpoint's transfer type, the low two bits of `bmAttributes`.
+public enum TransferType {
+    Control,
+    Isochronous,
+    Bulk,
+    Interrupt,
+}
+
+/// The transfer type `bmAttributes` encodes.
+public fn transferTypeOf(attributes: u8) -> TransferType => match (attributes & 3) {
+    0 => TransferType.Control,
+    1 => TransferType.Isochronous,
+    2 => TransferType.Bulk,
+    _ => TransferType.Interrupt,
+};
+
+/// The type bits of a control request (`bmRequestType` bits 5-6).
+public enum ControlType {
+    Standard,
+    Class,
+    Vendor,
+}
+
+/// The recipient bits of a control request (`bmRequestType` bits 0-4).
+public enum Recipient {
+    Device,
+    /// `index` holds the interface number.
+    Interface,
+    /// `index` holds the endpoint address.
+    Endpoint,
+    Other,
+}
+
+/// A control request on the default control endpoint, without its direction and data, which the call supplies.
+public struct ControlRequest {
+    public controlType: ControlType;
+    public recipient: Recipient;
+    /// `bRequest`
+    public request: u8;
+    /// `wValue`
+    public value: u16;
+    /// `wIndex`
+    public index: u16;
+
+    public fn create(
+        controlType: ControlType,
+        recipient: Recipient,
+        request: u8,
+        value: u16,
+        index: u16,
+    ) -> ControlRequest =>
+        ControlRequest { controlType: controlType, recipient: recipient, request: request, value: value, index: index };
+
+    /// A vendor request to the device.
+    public fn vendor(recipient: Recipient, request: u8, value: u16, index: u16) -> ControlRequest =>
+        ControlRequest {
+            controlType: ControlType.Vendor,
+            recipient: recipient,
+            request: request,
+            value: value,
+            index: index,
+        };
+
+    /// `bmRequestType` for this request in `direction`.
+    public fn requestType(borrow this, direction: Direction) -> u8 {
+        let d: u8 = if (direction is Direction.In) 0x80 else 0;
+        let t: u8 = match (this.controlType) {
+            ControlType.Standard => 0,
+            ControlType.Class => 0x20,
+            ControlType.Vendor => 0x40,
+        };
+        let r: u8 = match (this.recipient) {
+            Recipient.Device => 0,
+            Recipient.Interface => 1,
+            Recipient.Endpoint => 2,
+            Recipient.Other => 3,
+        };
+        return d | t | r;
+    }
+
+    /// Writes the 8-byte SETUP packet for a data stage of `length` bytes.
+    public fn writeSetup(borrow this, to: SliceMut<u8>, direction: Direction, length: u16) {
+        to[0] = this.requestType(direction);
+        to[1] = this.request;
+        to.writeLE(2, this.value);
+        to.writeLE(4, this.index);
+        to.writeLE(6, length);
+    }
+}
+
+/// GET_DESCRIPTOR as a control request.
+public fn getDescriptorRequest(descriptorType: u8, descriptorIndex: u8, languageId: u16) -> ControlRequest =>
+    ControlRequest {
+        controlType: ControlType.Standard,
+        recipient: Recipient.Device,
+        request: 0x06,
+        value: ((descriptorType as u16) << 8) | descriptorIndex as u16,
+        index: languageId,
+    };
+
+/// The bit for an endpoint address in a 32-bit claim mask: ((address & 15) << 1) | direction.
+fn endpointBit(address: u8) -> u32 => 1u32 << ((((address & 0x0F) as u32) << 1) | ((address >> 7) as u32));
+
+/// A transfer type's `bmAttributes` code (0 control, 1 isochronous, 2 bulk, 3 interrupt).
+public fn transferTypeCode(kind: TransferType) -> u8 => match (kind) {
+    TransferType.Control => 0,
+    TransferType.Isochronous => 1,
+    TransferType.Bulk => 2,
+    TransferType.Interrupt => 3,
+};

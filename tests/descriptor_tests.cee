@@ -1,0 +1,270 @@
+// Descriptor parser tests, ported from the C# suite (itself nusb's src/descriptors.rs tests): same inputs, same
+// expectations.
+
+fn configCount(input: Slice<u8>) -> u64 {
+    var n: u64 = 0;
+    var it = ConfigurationIter.over(input);
+    for (c in it) {
+        n += 1;
+    }
+    return n;
+}
+
+@test
+fn concatenatedEmptyAndShort() -> Result<void, TestFailure> {
+    let empty: Slice<u8> = [];
+    Check.equalU64(0, configCount(empty))?;
+    let short = [0u8];
+    Check.equalU64(0, configCount(short[..]))?;
+    let badTotal = [9u8, 2, 0, 0, 0, 0, 0, 0, 0];
+    Check.equalU64(0, configCount(badTotal[..]))?;
+    return Ok();
+}
+
+@test
+fn concatenatedConfigs() -> Result<void, TestFailure> {
+    let simple = [9u8, 2, 9, 0, 0, 0, 0, 0, 0];
+    Check.equalU64(1, configCount(simple[..]))?;
+    let input = [9u8, 2, 13, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 9, 2, 9, 0, 0, 0, 0, 0, 0];
+    var it = ConfigurationIter.over(input[..]);
+    let first = it.next()!;
+    Check.equalBytes(input[0..13], first.bytes)?;
+    let second = it.next()!;
+    Check.equalBytes(input[13..22], second.bytes)?;
+    Check.isTrue(it.next().isNull(), "two configurations")?;
+    return Ok();
+}
+
+@test
+fn emptyAndMalformedConfig() -> Result<void, TestFailure> {
+    let bytes = [9u8, 2, 9, 0, 0, 1, 0, 0, 250];
+    let c = ConfigurationDescriptor { bytes: bytes[..] };
+    Check.equalU64(0, c.interfaceCount() as u64)?;
+    Check.equalU64(1, c.value() as u64)?;
+    Check.equalU64(0, c.stringIndex() as u64)?;
+    var groups = c.interfaces();
+    Check.isTrue(groups.next().isNull(), "no interfaces")?;
+    let bad = [9u8, 2, 0, 0, 0, 1, 0, 0, 2, 5, 250, 0, 0, 0];
+    let m = ConfigurationDescriptor { bytes: bad[..] };
+    var mg = m.interfaces();
+    Check.isTrue(mg.next().isNull(), "malformed: no interfaces")?;
+    return Ok();
+}
+
+@test
+fn linuxRootHub() -> Result<void, TestFailure> {
+    let raw = [
+        0x12u8,
+        0x01,
+        0x00,
+        0x02,
+        0x09,
+        0x00,
+        0x01,
+        0x40,
+        0x6b,
+        0x1d,
+        0x02,
+        0x00,
+        0x10,
+        0x05,
+        0x03,
+        0x02,
+        0x01,
+        0x01,
+    ];
+    let dev = DeviceDescriptor.parse(raw[..])!;
+    Check.equalU64(0x0200, dev.usbVersion() as u64)?;
+    Check.equalU64(0x09, dev.deviceClass() as u64)?;
+    Check.equalU64(0x01, dev.deviceProtocol() as u64)?;
+    Check.equalU64(64, dev.maxPacketSize0() as u64)?;
+    Check.equalU64(0x1d6b, dev.vendorId() as u64)?;
+    Check.equalU64(0x0002, dev.productId() as u64)?;
+    Check.equalU64(0x0510, dev.deviceVersion() as u64)?;
+    Check.equalU64(3, dev.manufacturerIndex() as u64)?;
+    Check.equalU64(2, dev.productIndex() as u64)?;
+    Check.equalU64(1, dev.serialIndex() as u64)?;
+    Check.equalU64(1, dev.configurationCount() as u64)?;
+
+    let cfg = [
+        0x09u8,
+        0x02,
+        0x19,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        0xe0,
+        0x00,
+        0x09,
+        0x04,
+        0x00,
+        0x00,
+        0x01,
+        0x09,
+        0x00,
+        0x00,
+        0x00,
+        0x07,
+        0x05,
+        0x81,
+        0x03,
+        0x04,
+        0x00,
+        0x0c,
+    ];
+    let c = ConfigurationDescriptor.parse(cfg[..])!;
+    Check.equalU64(1, c.interfaceCount() as u64)?;
+    Check.equalU64(0, c.maxPower() as u64)?;
+    var groups = c.interfaces();
+    let g = groups.next()!;
+    Check.isTrue(groups.next().isNull(), "one interface")?;
+    Check.equalU64(0, g.number as u64)?;
+    var alts = g.altSettings();
+    let alt = alts.next()!;
+    Check.isTrue(alts.next().isNull(), "one alt setting")?;
+    Check.equalU64(1, alt.endpointCount() as u64)?;
+    Check.equalU64(9, alt.interfaceClass() as u64)?;
+    var eps = alt.endpoints();
+    let ep = eps.next()!;
+    Check.isTrue(eps.next().isNull(), "one endpoint")?;
+    Check.equalU64(0x81, ep.address() as u64)?;
+    Check.isTrue(ep.transferType() is TransferType.Interrupt, "interrupt")?;
+    Check.isTrue(ep.direction() is Direction.In, "in")?;
+    Check.equalU64(4, ep.maxPacketSize() as u64)?;
+    Check.equalU64(12, ep.interval() as u64)?;
+    return Ok();
+}
+
+@test
+fn dellWebcam() -> Result<void, TestFailure> {
+    let bytes = DELL_WEBCAM;
+    // wTotalLength (0x02a3) disagrees with the buffer, so the view is made directly, as nusb's test does.
+    let c = ConfigurationDescriptor { bytes: bytes[..] };
+    Check.equalU64(1, c.value() as u64)?;
+    Check.equalU64(2, c.interfaceCount() as u64)?;
+    Check.equalU64(250, c.maxPower() as u64)?;
+    var groups = c.interfaces();
+    let if0 = groups.next()!;
+    let if1 = groups.next()!;
+    Check.isTrue(groups.next().isNull(), "two interfaces")?;
+
+    Check.equalU64(0, if0.number as u64)?;
+    let alt0 = if0.first();
+    Check.equalU64(14, alt0.interfaceClass() as u64)?;
+    Check.equalU64(1, alt0.interfaceSubclass() as u64)?;
+    let expected = [0x24u8, 0x24, 0x24, 0x24, 0x24, 0x24, 0x05, 0x25];
+    var k: usize = 0;
+    var ds = alt0.descriptors();
+    for (d in ds) {
+        Check.isTrue(k < expected.length, "not too many descriptors")?;
+        Check.equalU64(expected[k] as u64, d.descriptorType() as u64)?;
+        k += 1;
+    }
+    Check.equalU64(8, k as u64)?;
+    var eps = alt0.endpoints();
+    let ep = eps.next()!;
+    Check.equalU64(0x83, ep.address() as u64)?;
+    Check.equalU64(16, ep.maxPacketSize() as u64)?;
+    var companions = ep.descriptors();
+    Check.equalU64(0x25, companions.next()!.descriptorType() as u64)?;
+
+    Check.equalU64(1, if1.number as u64)?;
+    let sizes = [0u64, 128, 256, 800, 800, 800, 1024];
+    let per = [0u32, 1, 1, 1, 2, 3, 3];
+    var i: usize = 0;
+    var alts = if1.altSettings();
+    for (alt in alts) {
+        Check.equalU64(i as u64, alt.altSetting() as u64)?;
+        Check.equalU64(2, alt.interfaceSubclass() as u64)?;
+        var es = alt.endpoints();
+        if (i == 0) {
+            Check.equalU64(0, alt.endpointCount() as u64)?;
+            Check.isTrue(es.next().isNull(), "alt 0 has no endpoints")?;
+        } else {
+            let e = es.next()!;
+            Check.equalU64(0x81, e.address() as u64)?;
+            Check.isTrue(e.transferType() is TransferType.Isochronous, "iso")?;
+            Check.equalU64(sizes[i], e.maxPacketSize() as u64)?;
+            Check.equalU64(per[i] as u64, e.packetsPerMicroframe() as u64)?;
+        }
+        i += 1;
+    }
+    Check.equalU64(7, i as u64)?;
+    Check.isTrue(c.findAltSetting(1, 5).isSome(), "alt 5 found")?;
+    Check.isTrue(c.findAltSetting(1, 7).isNull(), "alt 7 absent")?;
+    return Ok();
+}
+
+@test
+fn strings() -> Result<void, TestFailure> {
+    var s = String.create();
+    let ab = [6u8, 0x03, 'A', 0, 'B', 0];
+    Check.isTrue(decodeStringDescriptor(ab[..], mut s)!, "valid")?;
+    Check.equalText("AB", s.view())?;
+    let badLength = [4u8, 0x03, 'A', 0, 'B', 0];
+    Check.isTrue(!decodeStringDescriptor(badLength[..], mut s)!, "length mismatch")?;
+    let badType = [4u8, 0x04, 'A', 0];
+    Check.isTrue(!decodeStringDescriptor(badType[..], mut s)!, "wrong type")?;
+    var odd = String.create();
+    let oddBytes = [5u8, 0x03, 'A', 0, 0xFF];
+    Check.isTrue(decodeStringDescriptor(oddBytes[..], mut odd)!, "odd length")?;
+    Check.equalText("A", odd.view())?;
+    var lone = String.create();
+    let surrogate = [4u8, 0x03, 0x00, 0xD8];
+    Check.isTrue(decodeStringDescriptor(surrogate[..], mut lone)!, "lone surrogate")?;
+    Check.equalText("\u{FFFD}", lone.view())?;
+    var pair = String.create();
+    let emoji = [6u8, 0x03, 0x3D, 0xD8, 0x00, 0xDE]; // U+1F600
+    Check.isTrue(decodeStringDescriptor(emoji[..], mut pair)!, "pair")?;
+    Check.equalU64(4, pair.length as u64)?;
+    var langs = Vector<u16>.create();
+    let l = [6u8, 0x03, 0x09, 0x04, 0x07, 0x04];
+    Check.isTrue(decodeLanguageIds(l[..], mut langs)!, "langs")?;
+    Check.equalU64(2, langs.length as u64)?;
+    Check.equalU64(0x0409, langs[0] as u64)?;
+    Check.equalU64(0x0407, langs[1] as u64)?;
+    return Ok();
+}
+
+@test
+fn controlSetupPacket() -> Result<void, TestFailure> {
+    let r = ControlRequest.create(ControlType.Vendor, Recipient.Interface, 0x01, 0x1234, 0x0002);
+    var setup = [0u8; 8];
+    r.writeSetup(mut setup[..], Direction.In, 64);
+    let expected = [0xC1u8, 0x01, 0x34, 0x12, 0x02, 0x00, 0x40, 0x00];
+    Check.equalBytes(expected[..], setup[..])?;
+    Check.equalU64(0x80, getDescriptorRequest(1, 0, 0).requestType(Direction.In) as u64)?;
+    Check.equalU64(0x0100, getDescriptorRequest(1, 0, 0).value as u64)?;
+    return Ok();
+}
+
+const DELL_WEBCAM: [u8; 318] = [
+    0x09, 0x02, 0xa3, 0x02, 0x02, 0x01, 0x00, 0x80, 0xfa, 0x28, 0xff, 0x42,
+    0x49, 0x53, 0x54, 0x00, 0x01, 0x06, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xd1, 0x10, 0xd0, 0x07, 0xd2, 0x11, 0xf4, 0x01, 0xd3, 0x12, 0xf4,
+    0x01, 0xd4, 0x13, 0xf4, 0x01, 0xd5, 0x14, 0xd0, 0x07, 0xd6, 0x15, 0xf4,
+    0x01, 0x08, 0x0b, 0x00, 0x02, 0x0e, 0x03, 0x00, 0x05, 0x09, 0x04, 0x00,
+    0x00, 0x01, 0x0e, 0x01, 0x00, 0x05, 0x0d, 0x24, 0x01, 0x00, 0x01, 0x67,
+    0x00, 0xc0, 0xe1, 0xe4, 0x00, 0x01, 0x01, 0x09, 0x24, 0x03, 0x05, 0x01,
+    0x01, 0x00, 0x04, 0x00, 0x1a, 0x24, 0x06, 0x03, 0x70, 0x33, 0xf0, 0x28,
+    0x11, 0x63, 0x2e, 0x4a, 0xba, 0x2c, 0x68, 0x90, 0xeb, 0x33, 0x40, 0x16,
+    0x08, 0x01, 0x02, 0x01, 0x9f, 0x00, 0x1a, 0x24, 0x06, 0x04, 0xc3, 0x85,
+    0xb8, 0x0f, 0xc2, 0x68, 0x47, 0x45, 0x90, 0xf7, 0x8f, 0x47, 0x57, 0x9d,
+    0x95, 0xfc, 0x08, 0x01, 0x03, 0x01, 0x0f, 0x00, 0x12, 0x24, 0x02, 0x01,
+    0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x0e,
+    0x00, 0x20, 0x0b, 0x24, 0x05, 0x02, 0x01, 0x00, 0x00, 0x02, 0x7f, 0x17,
+    0x00, 0x07, 0x05, 0x83, 0x03, 0x10, 0x00, 0x06, 0x05, 0x25, 0x03, 0x80,
+    0x00, 0x09, 0x04, 0x01, 0x00, 0x00, 0x0e, 0x02, 0x00, 0x00, 0x0f, 0x24,
+    0x01, 0x02, 0x85, 0x01, 0x81, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x00, 0x0b, 0x24, 0x06, 0x01, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x06, 0x24, 0x0d, 0x01, 0x01, 0x04, 0x09, 0x04, 0x01, 0x01, 0x01, 0x0e,
+    0x02, 0x00, 0x00, 0x07, 0x05, 0x81, 0x05, 0x80, 0x00, 0x01, 0x09, 0x04,
+    0x01, 0x02, 0x01, 0x0e, 0x02, 0x00, 0x00, 0x07, 0x05, 0x81, 0x05, 0x00,
+    0x01, 0x01, 0x09, 0x04, 0x01, 0x03, 0x01, 0x0e, 0x02, 0x00, 0x00, 0x07,
+    0x05, 0x81, 0x05, 0x20, 0x03, 0x01, 0x09, 0x04, 0x01, 0x04, 0x01, 0x0e,
+    0x02, 0x00, 0x00, 0x07, 0x05, 0x81, 0x05, 0x20, 0x0b, 0x01, 0x09, 0x04,
+    0x01, 0x05, 0x01, 0x0e, 0x02, 0x00, 0x00, 0x07, 0x05, 0x81, 0x05, 0x20,
+    0x13, 0x01, 0x09, 0x04, 0x01, 0x06, 0x01, 0x0e, 0x02, 0x00, 0x00, 0x07,
+    0x05, 0x81, 0x05, 0x00, 0x14, 0x01,
+];

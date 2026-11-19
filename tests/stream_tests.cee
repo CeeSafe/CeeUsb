@@ -1,0 +1,115 @@
+// Reader and Writer over a fake endpoint, with a thread that plays the OS: it completes every pending slot, IN
+// transfers with `actual` bytes.
+
+struct FakeOs {
+    stop: AtomicBool;
+    completed: AtomicU64;
+}
+
+/// Completes pending slots until told to stop.
+/// Safety: the addresses are slots of an endpoint the test keeps alive until this thread is joined.
+fn runOs(os: Arc<FakeOs>, addresses: Vector<usize>, actual: usize) {
+    while (!os.get().stop.load()) {
+        for (a in addresses.view()) {
+            let slot = unsafe { Ptr.toBorrow(a as *Slot) };
+            if (slot.state.loadWith(LoadOrdering.Acquire) == SLOT_PENDING) {
+                unsafe { completeSlot(a as *mut Slot, TransferStatus.Success, actual, 0); }
+                os.get().completed.fetchAdd(1);
+            }
+        }
+        yieldThread();
+    }
+}
+
+fn slots(ep: borrow mut Endpoint) -> Vector<usize> {
+    var out = Vector<usize>.create();
+    for (i in 0..ep.capacity()) {
+        out.push(borrow mut ep.ring.slots[i] as *mut Slot as usize)!;
+    }
+    return out;
+}
+
+@test
+fn readerHandsOutPacketsAcrossReads() -> Result<void, TestFailure> {
+    var ep = openFake(0x81, 4);
+    let addresses = slots(mut ep);
+    let os = Arc<FakeOs>.create(FakeOs { stop: AtomicBool.create(false), completed: AtomicU64.create(0) })!;
+    let mine = os.clone();
+    let t = Thread.spawn(move () => runOs(mine, addresses, 300))!;
+    var reader = match (Reader.create(ep, 512, 2)) {
+        Ok(r) => r,
+        Err(_) => {
+            return Check.fail("an IN endpoint makes a reader");
+        }
+    };
+    var chunk = [0u8; 128];
+    var total: usize = 0;
+    while (total < 3000) {
+        total += reader.read(mut chunk[..], 2000)!;
+    }
+    os.get().stop.store(true);
+    t.join();
+    Check.isTrue(os.get().completed.load() >= 10, "several transfers")?;
+    return Ok();
+}
+
+@test
+fn readerSplitsTransfersIntoReads() -> Result<void, TestFailure> {
+    var ep = openFake(0x81, 4);
+    let addresses = slots(mut ep);
+    let os = Arc<FakeOs>.create(FakeOs { stop: AtomicBool.create(false), completed: AtomicU64.create(0) })!;
+    let mine = os.clone();
+    let t = Thread.spawn(move () => runOs(mine, addresses, 300))!;
+    var reader = match (Reader.create(ep, 512, 1)) {
+        Ok(r) => r,
+        Err(_) => {
+            return Check.fail("reader");
+        }
+    };
+    var chunk = [0u8; 128];
+    // One 300-byte transfer reads as 128 + 128 + 44.
+    Check.equalU64(128, reader.read(mut chunk[..], 2000)! as u64)?;
+    Check.equalU64(128, reader.read(mut chunk[..], 2000)! as u64)?;
+    Check.equalU64(44, reader.read(mut chunk[..], 2000)! as u64)?;
+    var message = Vector<u8>.create();
+    reader.readMessage(mut message, 2000)!;
+    Check.equalU64(300, message.length as u64)?;
+    os.get().stop.store(true);
+    t.join();
+    return Ok();
+}
+
+@test
+fn writerBatchesIntoTransfers() -> Result<void, TestFailure> {
+    var ep = openFake(0x01, 4);
+    let addresses = slots(mut ep);
+    let os = Arc<FakeOs>.create(FakeOs { stop: AtomicBool.create(false), completed: AtomicU64.create(0) })!;
+    let mine = os.clone();
+    let t = Thread.spawn(move () => runOs(mine, addresses, 0))!;
+    var writer = match (Writer.create(ep, 512, 2)) {
+        Ok(w) => w,
+        Err(_) => {
+            return Check.fail("an OUT endpoint makes a writer");
+        }
+    };
+    var data = [7u8; 1300];
+    writer.write(data[..], 2000)!;
+    writer.flush(2000)!;
+    // 1300 bytes: 512 + 512 + 276.
+    Check.equalU64(3, os.get().completed.load())?;
+    writer.write(data[0..1024], 2000)!;
+    writer.flushEnd(2000)!;
+    // Two full packets' worth ends with a zero-length packet: 2 + 1 more.
+    Check.equalU64(6, os.get().completed.load())?;
+    Check.isTrue(writer.free.length <= 3, "buffers are reused, not reallocated")?;
+    os.get().stop.store(true);
+    t.join();
+    return Ok();
+}
+
+@test
+fn streamsRefuseTheWrongDirection() -> Result<void, TestFailure> {
+    Check.isTrue(Reader.create(openFake(0x01, 2), 512, 1).isErr(), "OUT endpoint is not a reader")?;
+    Check.isTrue(Writer.create(openFake(0x81, 2), 512, 1).isErr(), "IN endpoint is not a writer")?;
+    return Ok();
+}

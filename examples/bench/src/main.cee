@@ -1,0 +1,155 @@
+// Benchmarks, matched by benchmarks/csharp for the C# original:
+//   bench enum <n>                 listDevices, n times
+//   bench control <vid> <pid> <n>  open once, then n GET_DESCRIPTOR(device) control transfers
+//   bench open <vid> <pid> <n>     open and close the device n times
+//   bench acontrol <vid> <pid> <n> as control, from a task (controlInAsync)
+//   bench icontrol <vid> <pid> <n> claim interface 0, then n GET_DESCRIPTOR(device) through it (WinUSB's path)
+//   bench bulkout <vid> <pid> <n>  claim interface 0, then n one-transfer writes of ESC @ to bulk OUT 0x03
+//   bench stream <vid> <pid> <ep> <size> <depth> <seconds>  keep <depth> transfers in flight on <ep>
+// Each prints the mean time per operation in microseconds.
+
+fn hex16(text: StringView) -> u16 => text.parseIntRadix<u16>(16) ?? 0;
+
+fn count(i: usize) -> u64 => (Process.argument(i) ?? "1000").parseInt<u64>() ?? 1000;
+
+fn report(what: StringView, n: u64, ns: u64) {
+    Console.write(what);
+    Console.write(": ");
+    Console.write(ns / n / 1000);
+    Console.write(".");
+    let frac = (ns / n) % 1000 / 10;
+    if (frac < 10) {
+        Console.write("0");
+    }
+    Console.write(frac);
+    Console.writeLine(" us/op");
+}
+
+fn find(vid: u16, pid: u16) -> usb.DeviceInfo {
+    let selector = usb.DeviceSelector.ids(vid, pid);
+    match (usb.Usb.findDevice(borrow selector)) {
+        Ok(Some(i)) => {
+            return i;
+        }
+        _ => {
+            Console.writeLine("device not found");
+            Process.exit(1);
+        }
+    }
+}
+
+async fn controlLoop(device: borrow usb.Device, n: u64) -> Result<void, usb.UsbError> {
+    var raw = [0u8; 18];
+    for (i in 0..n) {
+        await device.controlInAsync(usb.getDescriptorRequest(usb.DESCRIPTOR_DEVICE, 0, 0), mut raw[..], 1000)?;
+    }
+    return Ok();
+}
+
+fn main() {
+    let mode = Process.argument(1) ?? "enum";
+    if (mode == "enum") {
+        let n = count(2);
+        let start = Clock.monotonicNanos();
+        var devices: usize = 0;
+        for (i in 0..n) {
+            devices = usb.Usb.listDevices()!.length;
+        }
+        report("enumerate", n, Clock.monotonicNanos() - start);
+        Console.write("devices: ");
+        Console.writeLine(devices);
+        return;
+    }
+    let vid = hex16(Process.argument(2) ?? "0");
+    let pid = hex16(Process.argument(3) ?? "0");
+    let n = count(4);
+    let info = find(vid, pid);
+    if (mode == "open") {
+        let start = Clock.monotonicNanos();
+        for (i in 0..n) {
+            let d = usb.Usb.open(borrow info)!;
+        }
+        report("open+close", n, Clock.monotonicNanos() - start);
+        return;
+    }
+    let device = usb.Usb.open(borrow info)!;
+    if (mode == "stream") {
+        // stream <vid> <pid> <ep> <size> <depth> <seconds>: keep <depth> transfers of <size> in flight on <ep>.
+        let address = truncate<u8>(hex16(Process.argument(4) ?? "81"));
+        let size = (Process.argument(5) ?? "16384").parseInt<usize>() ?? 16384;
+        let depth = (Process.argument(6) ?? "8").parseInt<usize>() ?? 8;
+        let seconds = (Process.argument(7) ?? "5").parseInt<u64>() ?? 5;
+        let iface = device.detachAndClaimInterface(0)!;
+        var ep = iface.openEndpoint(address)!;
+        ep.clearHalt()!;
+        let isIn = (address & 0x80) != 0;
+        for (i in 0..depth) {
+            var b = ep.allocate(size)!;
+            if (isIn) {
+                b.setRequested(size);
+            } else {
+                let room = b.spare();
+                for (k in 0..room.length) {
+                    room[k] = truncate<u8>((k % 512) % 63);
+                }
+                b.setLength(size);
+            }
+            ep.submit(b)!;
+        }
+        let start = Clock.monotonicNanos();
+        let end = start + seconds * 1000000000;
+        var bytes: u64 = 0;
+        while (Clock.monotonicNanos() < end) {
+            let c = ep.waitComplete(2000)!;
+            bytes += c.actualLength as u64;
+            ep.submit(c.buffer)!;
+        }
+        let ns = Clock.monotonicNanos() - start;
+        Console.write("stream: ");
+        Console.write(bytes * 1000 / ns);
+        Console.writeLine(" MB/s");
+        return;
+    }
+    if (mode == "icontrol" || mode == "bulkout") {
+        let iface = device.claimInterface(0)!;
+        if (mode == "icontrol") {
+            var raw = [0u8; 18];
+            for (i in 0..10) {
+                iface.controlIn(usb.getDescriptorRequest(usb.DESCRIPTOR_DEVICE, 0, 0), mut raw[..], 1000)!;
+            }
+            let start = Clock.monotonicNanos();
+            for (i in 0..n) {
+                iface.controlIn(usb.getDescriptorRequest(usb.DESCRIPTOR_DEVICE, 0, 0), mut raw[..], 1000)!;
+            }
+            report("interface control GET_DESCRIPTOR", n, Clock.monotonicNanos() - start);
+            return;
+        }
+        // ESC @ (printer initialise; prints nothing) to bulk OUT 0x03, one transfer per write.
+        var out = iface.openEndpoint(0x03)!;
+        let init = [0x1Bu8, 0x40];
+        for (i in 0..10) {
+            out.write(init[..], 1000)!;
+        }
+        let start = Clock.monotonicNanos();
+        for (i in 0..n) {
+            out.write(init[..], 1000)!;
+        }
+        report("bulk OUT write (2 bytes)", n, Clock.monotonicNanos() - start);
+        return;
+    }
+    if (mode == "acontrol") {
+        let start = Clock.monotonicNanos();
+        Async.run(controlLoop(borrow device, n))!;
+        report("async control GET_DESCRIPTOR", n, Clock.monotonicNanos() - start);
+        return;
+    }
+    var raw = [0u8; 18];
+    for (i in 0..10) {
+        device.getDescriptor(usb.DESCRIPTOR_DEVICE, 0, 0, mut raw[..], 1000)!;
+    }
+    let start = Clock.monotonicNanos();
+    for (i in 0..n) {
+        device.getDescriptor(usb.DESCRIPTOR_DEVICE, 0, 0, mut raw[..], 1000)!;
+    }
+    report("control GET_DESCRIPTOR", n, Clock.monotonicNanos() - start);
+}

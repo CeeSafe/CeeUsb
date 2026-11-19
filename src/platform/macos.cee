@@ -1,0 +1,1392 @@
+// macOS: IOKit's IOUSBLib user client for I/O, the IORegistry for enumeration, IOKit notifications for hotplug,
+// one CFRunLoop thread for completions.
+//
+// Against the C# backend:
+// - Enumeration copies each device's registry properties once (IORegistryEntryCreateCFProperties) and reads them
+//   from the dictionary, instead of ~15 IORegistryEntrySearchCFProperty calls per device, each walking the
+//   registry, behind a lock-guarded key cache.
+// - Opening a device finds its service with IORegistryEntryIDMatching, one lookup, instead of iterating every
+//   USB device in the system.
+// - Control transfers are synchronous DeviceRequestTO calls: no run-loop round trip, no heap request record, no
+//   GCHandle, no TransferQueue. The device needs no async event source at all.
+// - Pipe completions find their slot from the callback's refcon, which is the slot itself.
+// - Teardown is safe without deferring to a thread pool: removing a source is followed by a barrier through the
+//   run loop (our own version-0 source), after which no callout of the removed source can still be running.
+// - The run loop always has the barrier source, so it never exits for want of sources (the C# loop slept 10 ms
+//   and retried).
+
+@header("usb_os.h")
+extern "C" {
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRelease(cf: *void);
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRetain(cf: *void) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFGetTypeID(cf: *void) -> usize;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFNumberGetTypeID() -> usize;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFStringGetTypeID() -> usize;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFDataGetTypeID() -> usize;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFNumberGetValue(number: *void, kind: i64, value: *mut i64) -> bool;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFStringCreateWithCString(allocator: *void, text: *CChar, encoding: u32) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFStringGetCString(text: *void, buffer: *mut u8, size: i64, encoding: u32) -> bool;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFDataGetBytePtr(data: *void) -> *u8;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFDataGetLength(data: *void) -> i64;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFDictionaryGetValue(dictionary: *void, key: *void) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRunLoopGetCurrent() -> *void;
+    @cfg("USB_OS_MACOS")
+    fn CFRunLoopRun();
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRunLoopAddSource(runLoop: *void, source: *void, mode: *void);
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRunLoopRemoveSource(runLoop: *void, source: *void, mode: *void);
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRunLoopWakeUp(runLoop: *void);
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRunLoopSourceCreate(allocator: *void, order: i64, context: *mut SourceContext) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFRunLoopSourceSignal(source: *void);
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn CFUUIDGetConstantUUIDWithBytes(
+        allocator: *void,
+        b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8,
+        b8: u8, b9: u8, b10: u8, b11: u8, b12: u8, b13: u8, b14: u8, b15: u8,
+    ) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn usb_cf_default_mode() -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn usb_iokit_pipe_async(
+        iface: *mut void,
+        pipe: u8,
+        write: i32,
+        buffer: *mut void,
+        size: u32,
+        callback: extern "C" fn(*mut void, i32, *mut void),
+        refcon: *mut void,
+    ) -> i32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn usb_iokit_abort_pipe(iface: *mut void, pipe: u8) -> i32;
+
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IOServiceMatching(name: *CChar) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IORegistryEntryIDMatching(id: u64) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IOServiceGetMatchingServices(port: u32, matching: *void, iterator: *mut u32) -> i32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IOServiceGetMatchingService(port: u32, matching: *void) -> u32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IOIteratorNext(iterator: u32) -> u32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IOObjectRelease(object: u32) -> i32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IORegistryEntryGetRegistryEntryID(entry: u32, id: *mut u64) -> i32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IORegistryEntryGetChildIterator(entry: u32, plane: *CChar, iterator: *mut u32) -> i32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IORegistryEntryCreateCFProperties(entry: u32, properties: *mut *void, allocator: *void, options: u32) -> i32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IOObjectConformsTo(object: u32, className: *CChar) -> bool;
+    @cfg("USB_OS_MACOS")
+    fn IOCreatePlugInInterfaceForService(
+        service: u32,
+        pluginType: *void,
+        interfaceType: *void,
+        plugin: *mut *mut *mut PluginVtbl,
+        score: *mut i32,
+    ) -> i32;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IONotificationPortCreate(port: u32) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IONotificationPortDestroy(port: *void);
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IONotificationPortGetRunLoopSource(port: *void) -> *void;
+    @cfg("USB_OS_MACOS")
+    @effects()
+    fn IOServiceAddMatchingNotification(
+        port: *void,
+        kind: *CChar,
+        matching: *void,
+        callback: extern "C" fn(*mut void, u32),
+        refcon: *mut void,
+        iterator: *mut u32,
+    ) -> i32;
+}
+
+const UTF8: u32 = 0x08000100;
+const NUMBER_SINT64: i64 = 4;
+
+// IOReturn values (as i32).
+const IO_SUCCESS: i32 = 0;
+const IO_NO_RESOURCES: i32 = -536870210;         // 0xE00002BE
+const IO_NOT_PRIVILEGED: i32 = -536870207;       // 0xE00002C1
+const IO_NO_DEVICE: i32 = -536870208;            // 0xE00002C0
+const IO_BAD_ARGUMENT: i32 = -536870206;         // 0xE00002C2
+const IO_EXCLUSIVE_ACCESS: i32 = -536870203;     // 0xE00002C5
+const IO_UNSUPPORTED: i32 = -536870201;          // 0xE00002C7
+const IO_BUSY: i32 = -536870187;                 // 0xE00002D5
+const IO_OFFLINE: i32 = -536870185;              // 0xE00002D7
+const IO_NOT_ATTACHED: i32 = -536870183;         // 0xE00002D9
+const IO_NOT_PERMITTED: i32 = -536870174;        // 0xE00002E2
+const IO_UNDERRUN: i32 = -536870169;             // 0xE00002E7
+const IO_TIMEOUT: i32 = -536870186;              // 0xE00002D6
+const IO_ABORTED: i32 = -536870165;              // 0xE00002EB
+const IO_NOT_FOUND: i32 = -536870160;            // 0xE00002F0
+const USB_PIPE_STALLED: i32 = -536854449;        // 0xE000404F
+const USB_TRANSACTION_TIMEOUT: i32 = -536854447; // 0xE0004051
+
+/// CFUUIDBytes, passed by value to QueryInterface.
+@repr(C)
+struct UuidBytes {
+    bytes: [u8; 16];
+}
+
+/// IOCFPlugInInterface's vtable, as far as used.
+@repr(C)
+struct PluginVtbl {
+    reserved: *void;
+    queryInterface: extern "C" fn(*mut void, UuidBytes, *mut *mut void) -> i32;
+    addRef: extern "C" fn(*mut void) -> u32;
+    release: extern "C" fn(*mut void) -> u32;
+}
+
+/// IOUSBDeviceInterface650's vtable (IOUSBLib.h), as far as used; the slots between are untyped.
+@repr(C)
+struct DeviceVtbl {
+    reserved: *void;
+    queryInterface: *void;
+    addRef: *void;
+    release: extern "C" fn(*mut void) -> u32;
+    createDeviceAsyncEventSource: *void;
+    getDeviceAsyncEventSource: *void;
+    createDeviceAsyncPort: *void;
+    getDeviceAsyncPort: *void;
+    deviceOpen: extern "C" fn(*mut void) -> i32;
+    deviceClose: extern "C" fn(*mut void) -> i32;
+    v10: [*void; 8];
+    getDeviceSpeed: extern "C" fn(*mut void, *mut u8) -> i32;
+    getNumberOfConfigurations: extern "C" fn(*mut void, *mut u8) -> i32;
+    getLocationID: *void;
+    getConfigurationDescriptorPtr: extern "C" fn(*mut void, u8, *mut *mut u8) -> i32;
+    getConfiguration: extern "C" fn(*mut void, *mut u8) -> i32;
+    setConfiguration: extern "C" fn(*mut void, u8) -> i32;
+    v24: [*void; 4];
+    createInterfaceIterator: extern "C" fn(*mut void, *mut FindInterface, *mut u32) -> i32;
+    deviceOpenSeize: *void;
+    deviceRequestTO: extern "C" fn(*mut void, *mut DeviceRequest) -> i32;
+    v31: [*void; 6];
+    deviceReEnumerate: extern "C" fn(*mut void, u32) -> i32;
+}
+
+/// IOUSBInterfaceInterface700's vtable, as far as used.
+@repr(C)
+struct InterfaceVtbl {
+    reserved: *void;
+    queryInterface: *void;
+    addRef: *void;
+    release: extern "C" fn(*mut void) -> u32;
+    createInterfaceAsyncEventSource: extern "C" fn(*mut void, *mut *void) -> i32;
+    v5: [*void; 3];
+    interfaceOpen: extern "C" fn(*mut void) -> i32;
+    interfaceClose: extern "C" fn(*mut void) -> i32;
+    v10: [*void; 7];
+    getInterfaceNumber: extern "C" fn(*mut void, *mut u8) -> i32;
+    getAlternateSetting: extern "C" fn(*mut void, *mut u8) -> i32;
+    getNumEndpoints: extern "C" fn(*mut void, *mut u8) -> i32;
+    v20: [*void; 2];
+    setAlternateInterface: extern "C" fn(*mut void, u8) -> i32;
+    v23: [*void; 3];
+    getPipeProperties: extern "C" fn(*mut void, u8, *mut u8, *mut u8, *mut u8, *mut u16, *mut u8) -> i32;
+    getPipeStatus: *void;
+    abortPipe: extern "C" fn(*mut void, u8) -> i32;
+    v29: [*void; 4];
+    readPipeAsync: extern "C" fn(*mut void, u8, *mut void, u32, extern "C" fn(*mut void, i32, *mut void), *mut void) -> i32;
+    writePipeAsync: extern "C" fn(*mut void, u8, *mut void, u32, extern "C" fn(*mut void, i32, *mut void), *mut void) -> i32;
+    v35: [*void; 10];
+    clearPipeStallBothEnds: extern "C" fn(*mut void, u8) -> i32;
+}
+
+/// IOUSBDevRequestTO
+@repr(C)
+struct DeviceRequest {
+    requestType: u8;
+    request: u8;
+    value: u16;
+    index: u16;
+    length: u16;
+    data: *mut u8;
+    done: u32;
+    noDataTimeout: u32;
+    completionTimeout: u32;
+}
+
+/// IOUSBFindInterfaceRequest
+@repr(C)
+struct FindInterface {
+    interfaceClass: u16;
+    interfaceSubclass: u16;
+    interfaceProtocol: u16;
+    alternateSetting: u16;
+}
+
+/// CFRunLoopSourceContext (version 0).
+@repr(C)
+struct SourceContext {
+    version: i64;
+    info: *mut void;
+    retain: *void;
+    release: *void;
+    copyDescription: *void;
+    equal: *void;
+    hash: *void;
+    schedule: *void;
+    cancel: *void;
+    perform: extern "C" fn(*mut void);
+}
+
+// UUIDs, in the SDK headers' byte order.
+const UUID_DEVICE_USER_CLIENT: [u8; 16] = [
+    0x9d,
+    0xc7,
+    0xb7,
+    0x80,
+    0x9e,
+    0xc0,
+    0x11,
+    0xd4,
+    0xa5,
+    0x4f,
+    0x00,
+    0x0a,
+    0x27,
+    0x05,
+    0x28,
+    0x61,
+];
+const UUID_INTERFACE_USER_CLIENT: [u8; 16] = [
+    0x2d,
+    0x97,
+    0x86,
+    0xc6,
+    0x9e,
+    0xf3,
+    0x11,
+    0xd4,
+    0xad,
+    0x51,
+    0x00,
+    0x0a,
+    0x27,
+    0x05,
+    0x28,
+    0x61,
+];
+const UUID_CFPLUGIN: [u8; 16] = [
+    0xc2,
+    0x44,
+    0xe8,
+    0x58,
+    0x10,
+    0x9c,
+    0x11,
+    0xd4,
+    0x91,
+    0xd4,
+    0x00,
+    0x50,
+    0xe4,
+    0xc6,
+    0x42,
+    0x6f,
+];
+const UUID_DEVICE_650: [u8; 16] = [
+    0x4a,
+    0xac,
+    0x1b,
+    0x2e,
+    0x24,
+    0xc2,
+    0x47,
+    0x6a,
+    0x96,
+    0x4d,
+    0x91,
+    0x33,
+    0x35,
+    0x34,
+    0xf2,
+    0xcc,
+];
+const UUID_INTERFACE_700: [u8; 16] = [
+    0x17,
+    0xf9,
+    0xe5,
+    0x9c,
+    0xb0,
+    0xa1,
+    0x40,
+    0x1d,
+    0x9a,
+    0xc0,
+    0x8d,
+    0xe2,
+    0x7a,
+    0xc6,
+    0x04,
+    0x7e,
+];
+
+/// A CFUUIDRef for constant bytes (CF keeps one per value; never released).
+/// Safety: a plain CF call with values.
+fn cfUuid(b: [u8; 16]) -> *void {
+    if (cfg("USB_OS_MACOS")) {
+        return unsafe { CFUUIDGetConstantUUIDWithBytes(
+            0 as *void,
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[7],
+            b[8],
+            b[9],
+            b[10],
+            b[11],
+            b[12],
+            b[13],
+            b[14],
+            b[15],
+        ) };
+    }
+    return 0 as *void;
+}
+
+/// An IOReturn as an ErrorKind.
+fn kindFromIoReturn(r: i32) -> ErrorKind => match (r) {
+    IO_NOT_PERMITTED | IO_NOT_PRIVILEGED => ErrorKind.PermissionDenied,
+    IO_EXCLUSIVE_ACCESS | IO_BUSY | IO_NO_RESOURCES => ErrorKind.Busy,
+    IO_NO_DEVICE | IO_NOT_ATTACHED | IO_OFFLINE => ErrorKind.Disconnected,
+    IO_NOT_FOUND => ErrorKind.NotFound,
+    IO_UNSUPPORTED => ErrorKind.Unsupported,
+    IO_TIMEOUT | USB_TRANSACTION_TIMEOUT => ErrorKind.TimedOut,
+    IO_BAD_ARGUMENT => ErrorKind.InvalidArgument,
+    _ => ErrorKind.Other,
+};
+
+fn ioError(r: i32, operation: Operation) -> UsbError => UsbError.create(kindFromIoReturn(r), operation, r);
+
+/// A pipe completion's IOReturn as a TransferStatus.
+fn statusFromIoReturn(r: i32) -> TransferStatus => match (r) {
+    IO_SUCCESS | IO_UNDERRUN => TransferStatus.Success,
+    IO_NO_DEVICE | IO_NOT_ATTACHED => TransferStatus.Disconnected,
+    IO_ABORTED | USB_TRANSACTION_TIMEOUT | IO_TIMEOUT => TransferStatus.Cancelled,
+    USB_PIPE_STALLED => TransferStatus.Stall,
+    IO_BAD_ARGUMENT => TransferStatus.InvalidArgument,
+    _ => TransferStatus.Unknown,
+};
+
+// ---- The run loop ---------------------------------------------------------------------------------------------
+
+static MAC_STATE: AtomicU32 = AtomicU32.constant(0); // 0 not started, 1 starting, 2 running, 3 failed
+static MAC_LOOP: AtomicU64 = AtomicU64.constant(0);
+static MAC_BARRIER: AtomicU64 = AtomicU64.constant(0);
+static MAC_EPOCH: AtomicU64 = AtomicU64.constant(0);
+
+/// The run loop, started once per process.
+fn macLoop() -> Result<*void, UsbError> {
+    loop {
+        match (MAC_STATE.compareExchange(0, 1)) {
+            Ok(_) => {
+                if (!startThread(macLoopMain, loopMainWindows)) {
+                    MAC_STATE.store(3);
+                    return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, lastError()));
+                }
+                while (MAC_STATE.load() == 1) {
+                    sleepMs(0);
+                }
+            }
+            Err(state) => {
+                if (state == 2) {
+                    return Ok(truncate<usize>(MAC_LOOP.load()) as *void);
+                }
+                if (state == 3) {
+                    return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, 0));
+                }
+                sleepMs(0);
+            }
+        }
+    }
+}
+
+/// The run loop thread: adds the barrier source (which also keeps the loop from ever running out of sources),
+/// publishes the loop, and runs it for the life of the process.
+/// Safety: CF calls on this thread's own run loop; the context is copied by CFRunLoopSourceCreate.
+@callback
+fn macLoopMain(argument: *mut void) -> *mut void {
+    if (cfg("USB_OS_MACOS")) {
+        let rl = unsafe { CFRetain(CFRunLoopGetCurrent()) };
+        var context = SourceContext {
+            version: 0,
+            info: 0 as *mut void,
+            retain: 0 as *void,
+            release: 0 as *void,
+            copyDescription: 0 as *void,
+            equal: 0 as *void,
+            hash: 0 as *void,
+            schedule: 0 as *void,
+            cancel: 0 as *void,
+            perform: barrierPerform,
+        };
+        let barrier = unsafe { CFRunLoopSourceCreate(0 as *void, 0, borrow mut context as *mut SourceContext) };
+        if (barrier.isNull()) {
+            MAC_STATE.store(3);
+            return 0 as *mut void;
+        }
+        unsafe { CFRunLoopAddSource(rl, barrier, usb_cf_default_mode()); }
+        MAC_BARRIER.store(barrier as usize as u64);
+        MAC_LOOP.store(rl as usize as u64);
+        MAC_STATE.store(2);
+        loop {
+            unsafe { CFRunLoopRun(); }
+        }
+    }
+    return 0 as *mut void;
+}
+
+/// The barrier source's callout: one more pass of the loop is done.
+@callback
+fn barrierPerform(info: *mut void) {
+    MAC_EPOCH.fetchAdd(1);
+}
+
+/// Adds a source to the run loop.
+/// Safety: CF's run loop calls are thread-safe; the source is retained by the loop until removed.
+fn macAddSource(source: *void) -> Result<void, UsbError> {
+    let rl = macLoop()?;
+    if (cfg("USB_OS_MACOS")) {
+        unsafe {
+            CFRunLoopAddSource(rl, source, usb_cf_default_mode());
+            CFRunLoopWakeUp(rl);
+        }
+    }
+    return Ok();
+}
+
+/// Removes a source and returns once no callout of it can still be running (the barrier source has run since).
+/// Safety: as macAddSource; the barrier source lives for the process.
+fn macRemoveSource(source: *void) {
+    if (cfg("USB_OS_MACOS")) {
+        if (MAC_STATE.load() != 2) {
+            return;
+        }
+        let rl = truncate<usize>(MAC_LOOP.load()) as *void;
+        let barrier = truncate<usize>(MAC_BARRIER.load()) as *void;
+        unsafe { CFRunLoopRemoveSource(rl, source, usb_cf_default_mode()); }
+        let seen = MAC_EPOCH.load();
+        unsafe {
+            CFRunLoopSourceSignal(barrier);
+            CFRunLoopWakeUp(rl);
+        }
+        var spins: u32 = 0;
+        while (MAC_EPOCH.load() == seen) {
+            spins += 1;
+            if (spins < 64) {
+                yieldThread();
+            } else {
+                sleepMs(1);
+            }
+        }
+    }
+}
+
+// ---- Registry properties --------------------------------------------------------------------------------------
+
+/// A registry entry's properties, copied once; released on drop.
+struct Properties {
+    dictionary: *void;
+
+    /// Safety: IORegistryEntryCreateCFProperties gives a dictionary this value owns.
+    fn of(entry: u32) -> Properties {
+        var d: *void = 0 as *void;
+        if (cfg("USB_OS_MACOS")) {
+            if (unsafe { IORegistryEntryCreateCFProperties(
+                entry,
+                borrow mut d as *mut *void,
+                0 as *void,
+                0,
+            ) } != IO_SUCCESS) {
+                d = 0 as *void;
+            }
+        }
+        return Properties { dictionary: d };
+    }
+
+    /// The value for a key (a C string), borrowed from the dictionary, or null.
+    /// Safety: the key string is made and released here; the value is the dictionary's.
+    fn value(borrow this, key: CStr) -> *void {
+        if (cfg("USB_OS_MACOS")) {
+            if (this.dictionary.isNull()) {
+                return 0 as *void;
+            }
+            let k = unsafe { CFStringCreateWithCString(0 as *void, key.ptr(), UTF8) };
+            if (k.isNull()) {
+                return 0 as *void;
+            }
+            let v = unsafe { CFDictionaryGetValue(this.dictionary, k) };
+            unsafe { CFRelease(k); }
+            return v;
+        }
+        return 0 as *void;
+    }
+
+    /// Safety: the value is checked to be a CFNumber before it is read.
+    fn integer(borrow this, key: CStr) -> i64? {
+        if (cfg("USB_OS_MACOS")) {
+            let v = this.value(key);
+            if (v.isNull() || unsafe { CFGetTypeID(v) != CFNumberGetTypeID() }) {
+                return null;
+            }
+            var out: i64 = 0;
+            if (unsafe { CFNumberGetValue(v, NUMBER_SINT64, borrow mut out as *mut i64) }) {
+                return Some(out);
+            }
+        }
+        return null;
+    }
+
+    /// Safety: the value is checked to be a CFString (or CFData, for `name`-style keys) before it is read.
+    fn text(borrow this, key: CStr) -> Result<String?, AllocError> {
+        if (cfg("USB_OS_MACOS")) {
+            let v = this.value(key);
+            if (v.isNull()) {
+                return Ok(null);
+            }
+            let kind = unsafe { CFGetTypeID(v) };
+            if (kind == unsafe { CFStringTypeIDOrZero() }) {
+                var buffer = [0u8; 512];
+                if (unsafe { CFStringGetCString(v, borrow mut buffer[0] as *mut u8, 512, UTF8) }) {
+                    let n = buffer[..].indexOf([0u8][..]) ?? 0;
+                    return optionalString(StringView.fromUtf8(buffer[0..n]) ?? "");
+                }
+                return Ok(null);
+            }
+            if (kind == unsafe { CFDataGetTypeID() }) {
+                let length = truncate<usize>(unsafe { CFDataGetLength(v) });
+                let bytes = unsafe { Slice.fromRaw(CFDataGetBytePtr(v), length) };
+                let n = bytes.indexOf([0u8][..]) ?? bytes.length;
+                return optionalString(StringView.fromUtf8(bytes[0..n]) ?? "");
+            }
+        }
+        return Ok(null);
+    }
+
+    /// Safety: the dictionary is this value's own reference.
+    drop {
+        if (cfg("USB_OS_MACOS")) {
+            if (!this.dictionary.isNull()) {
+                unsafe { CFRelease(this.dictionary); }
+            }
+        }
+    }
+}
+
+/// CFStringGetTypeID, or 0 off macOS (so the caller's comparison compiles everywhere).
+/// Safety: a plain CF call.
+unsafe fn CFStringTypeIDOrZero() -> usize {
+    if (cfg("USB_OS_MACOS")) {
+        return CFStringGetTypeID();
+    }
+    return 0;
+}
+
+fn u8Of(p: borrow Properties, key: CStr) -> u8 => truncate<u8>(p.integer(key) ?? 0);
+
+fn u16Of(p: borrow Properties, key: CStr) -> u16 => truncate<u16>(p.integer(key) ?? 0);
+
+fn speedFromCode(code: i64?) -> Speed? => match (code ?? -1) {
+    0 => Some(Speed.Low),
+    1 => Some(Speed.Full),
+    2 => Some(Speed.High),
+    3 => Some(Speed.Super),
+    4 | 5 => Some(Speed.SuperPlus),
+    _ => null,
+};
+
+// ---- Enumeration ----------------------------------------------------------------------------------------------
+
+/// Calls `visit` for each service of a class; each service is released after the visit.
+/// Safety: IOKit iteration; the matching dictionary is consumed by IOServiceGetMatchingServices.
+fn eachService(className: CStr, visit: borrow mut fn(u32) -> Result<void, AllocError>) -> Result<void, AllocError> {
+    if (cfg("USB_OS_MACOS")) {
+        let matching = unsafe { IOServiceMatching(className.ptr()) };
+        if (matching.isNull()) {
+            return Ok();
+        }
+        var iterator: u32 = 0;
+        if (unsafe { IOServiceGetMatchingServices(0, matching, borrow mut iterator as *mut u32) } != IO_SUCCESS) {
+            return Ok();
+        }
+        defer { unsafe { IOObjectRelease(iterator); } }
+        loop {
+            let service = unsafe { IOIteratorNext(iterator) };
+            if (service == 0) {
+                break;
+            }
+            let result = visit(service);
+            unsafe { IOObjectRelease(service); }
+            result?;
+        }
+    }
+    return Ok();
+}
+
+fn macListDevices(out: borrow mut Vector<DeviceInfo>) -> Result<void, UsbError> {
+    var failed = false;
+    let r = eachService(c"IOUSBHostDevice", (service) => {
+        match (macProbe(service)?) {
+            Some(info) => {
+                out.push(info)?;
+            }
+            null => {}
+        }
+        return Ok();
+    });
+    if (r.isErr()) {
+        return Err(UsbError.noMemory(Operation.Enumerate));
+    }
+    return Ok();
+}
+
+/// A device's info from its registry entry, or null if it has no IDs (not yet configured by the stack).
+/// Safety: registry calls on a live service handle.
+fn macProbe(service: u32) -> Result<DeviceInfo?, AllocError> {
+    if (cfg("USB_OS_MACOS")) {
+        var id: u64 = 0;
+        if (unsafe { IORegistryEntryGetRegistryEntryID(service, borrow mut id as *mut u64) } != IO_SUCCESS) {
+            return Ok(null);
+        }
+        let p = Properties.of(service);
+        let vendor = match (p.integer(c"idVendor")) {
+            Some(v) => truncate<u16>(v),
+            null => {
+                return Ok(null);
+            }
+        };
+        let location = truncate<u32>(p.integer(c"locationID") ?? 0);
+        var chain = Vector<u8>.create();
+        var shifted = location << 8;
+        while (shifted != 0) {
+            chain.push(truncate<u8>(shifted >> 28))?;
+            shifted = shifted << 4;
+        }
+        var busId = String.create();
+        var digits = [0u8; 4];
+        var w = TextWriter.create(mut digits[..]);
+        w.hex((location >> 24) as u64, 2);
+        busId.append(StringView.fromUtf8(w.written())!)?;
+        var manufacturer = p.text(c"kUSBVendorString")?;
+        if (manufacturer.isNull()) {
+            manufacturer = p.text(c"USB Vendor Name")?;
+        }
+        var product = p.text(c"kUSBProductString")?;
+        if (product.isNull()) {
+            product = p.text(c"USB Product Name")?;
+        }
+        var serial = p.text(c"kUSBSerialNumberString")?;
+        if (serial.isNull()) {
+            serial = p.text(c"USB Serial Number")?;
+        }
+        let lastPort = (if (chain.length > 0) chain[chain.length - 1] else 0) as u32;
+        return Ok(Some(DeviceInfo {
+            id: DeviceId { value: id },
+            busId: busId,
+            address: u8Of(borrow p, c"USB Address"),
+            portChain: chain,
+            vendorId: vendor,
+            productId: u16Of(borrow p, c"idProduct"),
+            deviceVersion: u16Of(borrow p, c"bcdDevice"),
+            usbVersion: u16Of(borrow p, c"bcdUSB"),
+            deviceClass: u8Of(borrow p, c"bDeviceClass"),
+            deviceSubclass: u8Of(borrow p, c"bDeviceSubClass"),
+            deviceProtocol: u8Of(borrow p, c"bDeviceProtocol"),
+            speed: speedFromCode(p.integer(c"Device Speed") ?? p.integer(c"USBSpeed")),
+            manufacturer: manufacturer,
+            product: product,
+            serialNumber: serial,
+            interfaces: macProbeInterfaces(service)?,
+            path: String.create(),
+            busNumber: 0,
+            registryId: id,
+            port: lastPort,
+            parentId: null,
+            locationId: location,
+            driver: null,
+        }));
+    }
+    return Ok(null);
+}
+
+/// The interfaces under a device in the service plane, sorted by number.
+/// Safety: registry iteration on a live service handle; every child is released.
+fn macProbeInterfaces(device: u32) -> Result<Vector<InterfaceInfo>, AllocError> {
+    var out = Vector<InterfaceInfo>.create();
+    if (cfg("USB_OS_MACOS")) {
+        var iterator: u32 = 0;
+        if (unsafe { IORegistryEntryGetChildIterator(
+            device,
+            c"IOService".ptr(),
+            borrow mut iterator as *mut u32,
+        ) } != IO_SUCCESS) {
+            return Ok(out);
+        }
+        defer { unsafe { IOObjectRelease(iterator); } }
+        loop {
+            let child = unsafe { IOIteratorNext(iterator) };
+            if (child == 0) {
+                break;
+            }
+            let p = Properties.of(child);
+            unsafe { IOObjectRelease(child); }
+            match (p.integer(c"bInterfaceNumber")) {
+                Some(n) => {
+                    var name = p.text(c"kUSBString")?;
+                    if (name.isNull()) {
+                        name = p.text(c"USB Interface Name")?;
+                    }
+                    let info = InterfaceInfo {
+                        number: truncate<u8>(n),
+                        interfaceClass: u8Of(borrow p, c"bInterfaceClass"),
+                        interfaceSubclass: u8Of(borrow p, c"bInterfaceSubClass"),
+                        interfaceProtocol: u8Of(borrow p, c"bInterfaceProtocol"),
+                        name: name,
+                    };
+                    // Insertion keeps the list sorted; a device has a handful of interfaces.
+                    var at = out.length;
+                    while (at > 0 && out[at - 1].number > info.number) {
+                        at -= 1;
+                    }
+                    VectorEditing<InterfaceInfo>.insert(mut out, at, info)?;
+                }
+                null => {}
+            }
+        }
+    }
+    return Ok(out);
+}
+
+/// Safety: registry calls on live service handles.
+fn macListBuses(out: borrow mut Vector<BusInfo>) -> Result<void, UsbError> {
+    let r = eachService(c"AppleUSBHostController", (service) => {
+        if (cfg("USB_OS_MACOS")) {
+            var id: u64 = 0;
+            if (unsafe { IORegistryEntryGetRegistryEntryID(service, borrow mut id as *mut u64) } != IO_SUCCESS) {
+                return Ok();
+            }
+            let p = Properties.of(service);
+            let location = truncate<u32>(p.integer(c"locationID") ?? 0);
+            var busId = String.create();
+            var digits = [0u8; 4];
+            var w = TextWriter.create(mut digits[..]);
+            w.hex((location >> 24) as u64, 2);
+            busId.append(StringView.fromUtf8(w.written())!)?;
+            let ioClass = p.text(c"IOClass")?;
+            let kind = match (borrow ioClass) {
+                Some(c) => controllerTypeFromName(c.view()),
+                null => null,
+            };
+            out.push(BusInfo {
+                busId: busId,
+                controllerType: kind,
+                driver: p.text(c"CFBundleIdentifier")?,
+                name: ioClass,
+                path: String.create(),
+                registryId: id,
+                locationId: location,
+            })?;
+        }
+        return Ok();
+    });
+    if (r.isErr()) {
+        return Err(UsbError.noMemory(Operation.Enumerate));
+    }
+    return Ok();
+}
+
+// ---- Device and interface handles -----------------------------------------------------------------------------
+
+/// Makes an IOUSBLib user-client object of `interfaceUuid` for a service; retries briefly while the kernel is
+/// still publishing it (kIOReturnNoResources), as the C# version did.
+/// Safety: COM-style calls through vtables IOKit gives; the plugin is released here, the result returned owned.
+fn createPlugin(
+    service: u32,
+    userClient: [u8; 16],
+    interfaceUuid: [u8; 16],
+    operation: Operation,
+) -> Result<*mut void, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        var plugin: *mut *mut PluginVtbl = 0 as *mut *mut PluginVtbl;
+        var score: i32 = 0;
+        var r: i32 = 0;
+        for (attempt in 0..5) {
+            r = unsafe { IOCreatePlugInInterfaceForService(
+                service,
+                cfUuid(userClient),
+                cfUuid(UUID_CFPLUGIN),
+                borrow mut plugin as *mut *mut *mut PluginVtbl,
+                borrow mut score as *mut i32,
+            ) };
+            if (r != IO_NO_RESOURCES) {
+                break;
+            }
+            sleepMs(1);
+        }
+        if (r != IO_SUCCESS || plugin.isNull()) {
+            return Err(ioError(r, operation));
+        }
+        let vt = unsafe { plugin.read().read() };
+        var result: *mut void = 0 as *mut void;
+        let q = unsafe { vt.queryInterface(
+            plugin as *mut void,
+            UuidBytes { bytes: interfaceUuid },
+            borrow mut result as *mut *mut void,
+        ) };
+        unsafe { vt.release(plugin as *mut void); }
+        if (q != 0 || result.isNull()) {
+            return Err(UsbError.create(ErrorKind.Other, operation, q));
+        }
+        return Ok(result);
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, operation, 0));
+}
+
+/// The vtable of an IOUSBLib device object (`IOUSBDeviceInterface650 **`).
+/// Safety: callers pass an object createPlugin made and has not released.
+unsafe fn deviceVtbl(device: *mut void) -> DeviceVtbl => (device as *mut *mut DeviceVtbl).read().read();
+
+/// Safety: as deviceVtbl.
+unsafe fn interfaceVtbl(iface: *mut void) -> InterfaceVtbl => (iface as *mut *mut InterfaceVtbl).read().read();
+
+/// What `macOpen` gives the device.
+struct MacOpened {
+    device: *mut void;
+    descriptor: DeviceDescriptor;
+    blob: Vector<u8>;
+    speed: Speed?;
+    exclusive: bool;
+}
+
+/// Opens a device by registry ID: its user client, its configurations (copied from IOKit's cache) and, if it can,
+/// exclusive access. Exclusive access failing is not an error here (descriptors still work); the calls that need
+/// it ask again.
+/// Safety: IOKit calls on handles this function owns until it returns them; the configuration pointers IOKit
+/// gives point into its cache, read for `wTotalLength` bytes and copied.
+fn macOpen(registryId: u64) -> Result<MacOpened, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        let service = unsafe { IOServiceGetMatchingService(0, IORegistryEntryIDMatching(registryId)) };
+        if (service == 0) {
+            return Err(UsbError.create(ErrorKind.Disconnected, Operation.Open, 0));
+        }
+        let p = Properties.of(service);
+        let descriptor = DeviceDescriptor.fromFields(
+            u16Of(borrow p, c"bcdUSB"),
+            u8Of(borrow p, c"bDeviceClass"),
+            u8Of(borrow p, c"bDeviceSubClass"),
+            u8Of(borrow p, c"bDeviceProtocol"),
+            u8Of(borrow p, c"bMaxPacketSize0"),
+            u16Of(borrow p, c"idVendor"),
+            u16Of(borrow p, c"idProduct"),
+            u16Of(borrow p, c"bcdDevice"),
+            u8Of(borrow p, c"iManufacturer"),
+            u8Of(borrow p, c"iProduct"),
+            u8Of(borrow p, c"iSerialNumber"),
+            u8Of(borrow p, c"bNumConfigurations"),
+        );
+        let speed = speedFromCode(p.integer(c"Device Speed") ?? p.integer(c"USBSpeed"));
+        let made = createPlugin(service, UUID_DEVICE_USER_CLIENT, UUID_DEVICE_650, Operation.Open);
+        unsafe { IOObjectRelease(service); }
+        let device = made?;
+        let vt = unsafe { deviceVtbl(device) };
+        var blob = Vector<u8>.create();
+        var count: u8 = 0;
+        unsafe { vt.getNumberOfConfigurations(device, borrow mut count as *mut u8); }
+        for (i in 0..count) {
+            var d: *mut u8 = 0 as *mut u8;
+            if (unsafe { vt.getConfigurationDescriptorPtr(
+                device,
+                i,
+                borrow mut d as *mut *mut u8,
+            ) } != IO_SUCCESS || d.isNull()) {
+                continue;
+            }
+            let header = unsafe { Slice.fromRaw(d as *u8, 4) };
+            let total = header.readLE<u16>(2) as usize;
+            if (blob.extend(unsafe { Slice.fromRaw(d as *u8, total) }).isErr()) {
+                unsafe { vt.release(device); }
+                return Err(UsbError.noMemory(Operation.Open));
+            }
+        }
+        let exclusive = unsafe { vt.deviceOpen(device) } == IO_SUCCESS;
+        return Ok(MacOpened { device: device, descriptor: descriptor, blob: blob, speed: speed, exclusive: exclusive });
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.Open, 0));
+}
+
+/// Safety: the device object is owned by the caller, released exactly once here.
+fn macClose(device: *mut void, exclusive: bool) {
+    if (cfg("USB_OS_MACOS")) {
+        let vt = unsafe { deviceVtbl(device) };
+        if (exclusive) {
+            unsafe { vt.deviceClose(device); }
+        }
+        unsafe { vt.release(device); }
+    }
+}
+
+/// Opens the device for exclusive access if it is not yet; true once it is.
+/// Safety: a live device object.
+fn macRequireExclusive(device: *mut void, operation: Operation) -> Result<void, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        let r = unsafe { deviceVtbl(device).deviceOpen(device) };
+        if (r == IO_SUCCESS || r == IO_EXCLUSIVE_ACCESS) {
+            // kIOReturnExclusiveAccess from a second open by this same client means it is already ours; any other
+            // owner makes the operation below fail with its own code.
+            return Ok();
+        }
+        let kind = kindFromIoReturn(r);
+        return Err(UsbError.create(if (kind is ErrorKind.Other) ErrorKind.Busy else kind, operation, r));
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, operation, 0));
+}
+
+/// The active configuration's value, 0 if unconfigured.
+/// Safety: a live device object.
+fn macActiveConfiguration(device: *mut void) -> u8 {
+    if (cfg("USB_OS_MACOS")) {
+        var value: u8 = 0;
+        if (unsafe { deviceVtbl(device).getConfiguration(device, borrow mut value as *mut u8) } == IO_SUCCESS) {
+            return value;
+        }
+    }
+    return 0;
+}
+
+/// Safety: a live device object.
+fn macSetConfiguration(device: *mut void, value: u8) -> Result<void, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        let r = unsafe { deviceVtbl(device).setConfiguration(device, value) };
+        if (r != IO_SUCCESS) {
+            return Err(ioError(r, Operation.SetConfiguration));
+        }
+        return Ok();
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.SetConfiguration, 0));
+}
+
+/// Safety: a live device object.
+fn macReset(device: *mut void) -> Result<void, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        let r = unsafe { deviceVtbl(device).deviceReEnumerate(device, 0) };
+        if (r != IO_SUCCESS) {
+            return Err(ioError(r, Operation.Reset));
+        }
+        return Ok();
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.Reset, 0));
+}
+
+/// A control transfer on the default endpoint, synchronously, with IOKit's timeouts (0: none).
+/// Safety: `data` has `length` bytes for the call; the request record is on this stack frame.
+fn macControl(
+    device: *mut void,
+    requestType: u8,
+    request: ControlRequest,
+    data: *mut u8,
+    length: u16,
+    timeoutMs: u32,
+) -> Result<usize, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        var r = DeviceRequest {
+            requestType: requestType,
+            request: request.request,
+            value: request.value,
+            index: request.index,
+            length: length,
+            data: if (length == 0) 0 as *mut u8 else data,
+            done: 0,
+            noDataTimeout: timeoutMs,
+            completionTimeout: timeoutMs,
+        };
+        let ret = unsafe { deviceVtbl(device).deviceRequestTO(device, borrow mut r as *mut DeviceRequest) };
+        if (ret != IO_SUCCESS) {
+            let kind = if (ret == USB_PIPE_STALLED) ErrorKind.Other else kindFromIoReturn(ret);
+            return Err(UsbError.create(kind, Operation.ControlTransfer, ret));
+        }
+        return Ok(r.done as usize);
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.ControlTransfer, 0));
+}
+
+/// What `macClaim` gives the interface.
+struct MacClaimed {
+    iface: *mut void;
+    source: *void;
+    alt: u8;
+}
+
+/// Finds interface `number` under the device, opens its user client, adds its event source to the run loop and
+/// opens it for exclusive use.
+/// Safety: IOKit calls on objects this function owns until it returns them.
+fn macClaim(device: *mut void, number: u8) -> Result<MacClaimed, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        var find = FindInterface {
+            interfaceClass: 0xFFFF,
+            interfaceSubclass: 0xFFFF,
+            interfaceProtocol: 0xFFFF,
+            alternateSetting: 0xFFFF,
+        };
+        var iterator: u32 = 0;
+        let r = unsafe { deviceVtbl(device).createInterfaceIterator(
+            device,
+            borrow mut find as *mut FindInterface,
+            borrow mut iterator as *mut u32,
+        ) };
+        if (r != IO_SUCCESS) {
+            return Err(ioError(r, Operation.ClaimInterface));
+        }
+        var service: u32 = 0;
+        loop {
+            let s = unsafe { IOIteratorNext(iterator) };
+            if (s == 0) {
+                break;
+            }
+            let p = Properties.of(s);
+            if (p.integer(c"bInterfaceNumber") == Some(number as i64)) {
+                service = s;
+                break;
+            }
+            unsafe { IOObjectRelease(s); }
+        }
+        unsafe { IOObjectRelease(iterator); }
+        if (service == 0) {
+            return Err(UsbError.create(ErrorKind.NotFound, Operation.ClaimInterface, 0));
+        }
+        let made = createPlugin(service, UUID_INTERFACE_USER_CLIENT, UUID_INTERFACE_700, Operation.ClaimInterface);
+        unsafe { IOObjectRelease(service); }
+        let iface = made?;
+        let vt = unsafe { interfaceVtbl(iface) };
+        var source: *void = 0 as *void;
+        let sr = unsafe { vt.createInterfaceAsyncEventSource(iface, borrow mut source as *mut *void) };
+        if (sr != IO_SUCCESS) {
+            unsafe { vt.release(iface); }
+            return Err(ioError(sr, Operation.ClaimInterface));
+        }
+        let open = unsafe { vt.interfaceOpen(iface) };
+        if (open != IO_SUCCESS) {
+            unsafe {
+                CFRelease(source);
+                vt.release(iface);
+            }
+            return Err(ioError(open, Operation.ClaimInterface));
+        }
+        match (macAddSource(source)) {
+            Ok() => {}
+            Err(e) => {
+                unsafe {
+                    vt.interfaceClose(iface);
+                    CFRelease(source);
+                    vt.release(iface);
+                }
+                return Err(e);
+            }
+        }
+        var alt: u8 = 0;
+        unsafe { vt.getAlternateSetting(iface, borrow mut alt as *mut u8); }
+        return Ok(MacClaimed { iface: iface, source: source, alt: alt });
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.ClaimInterface, 0));
+}
+
+/// Releases an interface: closed, out of the run loop (with the barrier), then freed.
+/// Safety: no transfer is in flight (every endpoint drained before the interface core drops).
+fn macRelease(iface: *mut void, source: *void) {
+    if (cfg("USB_OS_MACOS")) {
+        let vt = unsafe { interfaceVtbl(iface) };
+        unsafe { vt.interfaceClose(iface); }
+        macRemoveSource(source);
+        unsafe {
+            CFRelease(source);
+            vt.release(iface);
+        }
+    }
+}
+
+/// Safety: a live interface object.
+fn macSetAltSetting(iface: *mut void, alt: u8) -> Result<void, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        let r = unsafe { interfaceVtbl(iface).setAlternateInterface(iface, alt) };
+        if (r != IO_SUCCESS) {
+            let kind = if (r == IO_BAD_ARGUMENT) ErrorKind.NotFound else kindFromIoReturn(r);
+            return Err(UsbError.create(kind, Operation.SetAltSetting, r));
+        }
+        return Ok();
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.SetAltSetting, 0));
+}
+
+/// The pipe reference of an endpoint address in the current alternate setting, or null.
+/// Safety: a live interface object; the out-parameters are locals.
+fn macPipeRef(iface: *mut void, address: u8) -> u8? {
+    if (cfg("USB_OS_MACOS")) {
+        let vt = unsafe { interfaceVtbl(iface) };
+        var count: u8 = 0;
+        if (unsafe { vt.getNumEndpoints(iface, borrow mut count as *mut u8) } != IO_SUCCESS) {
+            return null;
+        }
+        var pipe: u8 = 1;
+        while (pipe <= count) {
+            var direction: u8 = 0;
+            var number: u8 = 0;
+            var kind: u8 = 0;
+            var size: u16 = 0;
+            var interval: u8 = 0;
+            let r = unsafe { vt.getPipeProperties(
+                iface,
+                pipe,
+                borrow mut direction as *mut u8,
+                borrow mut number as *mut u8,
+                borrow mut kind as *mut u8,
+                borrow mut size as *mut u16,
+                borrow mut interval as *mut u8,
+            ) };
+            if (r == IO_SUCCESS && (number | (if (direction != 0) 0x80u8 else 0)) == address) {
+                return Some(pipe);
+            }
+            pipe += 1;
+        }
+    }
+    return null;
+}
+
+/// Submits a pipe transfer; on failure the slot is completed with the error at once.
+/// Safety: as linuxSubmit: the slot is the OS's until its callback runs; the buffer stays alive and unmoved.
+fn macSubmit(iface: *mut void, pipe: u8, isIn: bool, slot: *mut Slot, buffer: *mut u8, length: usize) {
+    if (cfg("USB_OS_MACOS")) {
+        let n = saturatingTruncate<u32>(length);
+        let r = unsafe { usb_iokit_pipe_async(
+            iface,
+            pipe,
+            if (isIn) 0 else 1,
+            buffer as *mut void,
+            n,
+            pipeDone,
+            slot as *mut void,
+        ) };
+        if (r != IO_SUCCESS) {
+            let status = statusFromIoReturn(r);
+            traceNumber(TraceLevel.Warn, "pipe submit failed, IOReturn", (truncate<u32>(r)) as u64);
+            unsafe {
+                completeSlot(slot, if (status is TransferStatus.Success) TransferStatus.Unknown else status, 0, r);
+            }
+        }
+    }
+}
+
+/// IOKit's completion callout, on the run loop thread: `refcon` is the slot.
+/// Safety: IOKit calls this once per accepted transfer with the refcon it was given, a live slot.
+@callback
+fn pipeDone(refcon: *mut void, result: i32, arg0: *mut void) {
+    unsafe {
+        completeSlot(
+            refcon as *mut Slot,
+            statusFromIoReturn(result),
+            arg0 as usize,
+            if (result == IO_SUCCESS) 0 else result,
+        );
+    }
+}
+
+/// Aborts every transfer on a pipe; they complete as Cancelled.
+/// Safety: a live interface object.
+fn macAbort(iface: *mut void, pipe: u8) {
+    if (cfg("USB_OS_MACOS")) {
+        unsafe { usb_iokit_abort_pipe(iface, pipe); }
+    }
+}
+
+/// Safety: a live interface object.
+fn macClearHalt(iface: *mut void, pipe: u8) -> Result<void, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        let r = unsafe { interfaceVtbl(iface).clearPipeStallBothEnds(iface, pipe) };
+        if (r != IO_SUCCESS) {
+            return Err(ioError(r, Operation.ClearHalt));
+        }
+        return Ok();
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.ClearHalt, 0));
+}
+
+// ---- Hotplug --------------------------------------------------------------------------------------------------
+
+/// A watcher's state the notification callout touches: its channel and its two iterators. Boxed, alive until the
+/// watcher's port source is removed with the barrier.
+struct MacWatch {
+    channel: Channel<HotplugEvent>;
+    port: *void;
+    arrived: u32;
+    left: u32;
+}
+
+/// Registers arrival and removal notifications for USB devices and adds their port to the run loop. The iterators
+/// are drained once here without reporting: that arms them and skips the devices already present.
+/// Safety: IOKit notification calls; `watch` is boxed by the caller and outlives the registration.
+fn macWatch(watch: borrow mut MacWatch) -> Result<void, UsbError> {
+    if (cfg("USB_OS_MACOS")) {
+        let port = unsafe { IONotificationPortCreate(0) };
+        if (port.isNull()) {
+            return Err(UsbError.create(ErrorKind.Other, Operation.Hotplug, 0));
+        }
+        watch.port = port;
+        let refcon = watch as *mut MacWatch as *mut void;
+        var left: u32 = 0;
+        let r1 = unsafe { IOServiceAddMatchingNotification(
+            port,
+            c"IOServiceTerminate".ptr(),
+            IOServiceMatching(c"IOUSBHostDevice".ptr()),
+            hotplugFired,
+            refcon,
+            borrow mut left as *mut u32,
+        ) };
+        var arrived: u32 = 0;
+        let r2 = unsafe { IOServiceAddMatchingNotification(
+            port,
+            c"IOServiceFirstMatch".ptr(),
+            IOServiceMatching(c"IOUSBHostDevice".ptr()),
+            hotplugFired,
+            refcon,
+            borrow mut arrived as *mut u32,
+        ) };
+        watch.left = left;
+        watch.arrived = arrived;
+        if (r1 != IO_SUCCESS || r2 != IO_SUCCESS) {
+            macUnwatch(watch);
+            return Err(ioError(if (r1 != IO_SUCCESS) r1 else r2, Operation.Hotplug));
+        }
+        drainNotifications(watch, false);
+        match (macAddSource(unsafe { IONotificationPortGetRunLoopSource(port) })) {
+            Ok() => {}
+            Err(e) => {
+                macUnwatch(watch);
+                return Err(e);
+            }
+        }
+        return Ok();
+    }
+    return Err(UsbError.create(ErrorKind.Unsupported, Operation.Hotplug, 0));
+}
+
+/// Safety: the port's source is removed with the barrier before the port and iterators go.
+fn macUnwatch(watch: borrow mut MacWatch) {
+    if (cfg("USB_OS_MACOS")) {
+        if (!watch.port.isNull()) {
+            macRemoveSource(unsafe { IONotificationPortGetRunLoopSource(watch.port) });
+            unsafe { IONotificationPortDestroy(watch.port); }
+            watch.port = 0 as *void;
+        }
+        if (watch.arrived != 0) {
+            unsafe { IOObjectRelease(watch.arrived); }
+            watch.arrived = 0;
+        }
+        if (watch.left != 0) {
+            unsafe { IOObjectRelease(watch.left); }
+            watch.left = 0;
+        }
+    }
+}
+
+/// The notification callout: which iterator fired is not said, so both are drained (draining re-arms them).
+/// Safety: refcon is the boxed MacWatch, alive while its port is in the run loop.
+@callback
+fn hotplugFired(refcon: *mut void, iterator: u32) {
+    let watch = unsafe { Ptr.toBorrow(refcon as *MacWatch) };
+    drainNotifications(watch, true);
+}
+
+/// Safety: iterators of a live watch; every service is released.
+fn drainNotifications(watch: borrow MacWatch, report: bool) {
+    if (cfg("USB_OS_MACOS")) {
+        loop {
+            let s = unsafe { IOIteratorNext(watch.arrived) };
+            if (s == 0) {
+                break;
+            }
+            if (report) {
+                match (macProbe(s)) {
+                    Ok(Some(info)) => {
+                        let _ = watch.channel.trySend(HotplugEvent.Arrived(info));
+                    }
+                    _ => {}
+                }
+            }
+            unsafe { IOObjectRelease(s); }
+        }
+        loop {
+            let s = unsafe { IOIteratorNext(watch.left) };
+            if (s == 0) {
+                break;
+            }
+            if (report) {
+                var id: u64 = 0;
+                if (unsafe { IORegistryEntryGetRegistryEntryID(s, borrow mut id as *mut u64) } == IO_SUCCESS) {
+                    let _ = watch.channel.trySend(HotplugEvent.Left(DeviceId { value: id }));
+                }
+            }
+            unsafe { IOObjectRelease(s); }
+        }
+    }
+}

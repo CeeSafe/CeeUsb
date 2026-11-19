@@ -1,0 +1,156 @@
+// Errors. A control-plane call (open, claim, configure, a control transfer) returns Result<T, UsbError>; a data
+// transfer reports a TransferStatus on its Completion, so a stream of transfers never stops for one failure.
+
+/// The coarse class of a failure, the same on every platform. The operating system's own code is kept beside it
+/// in `UsbError.code`.
+public enum ErrorKind {
+    /// The device was unplugged, or is no longer reachable.
+    Disconnected,
+    /// The device, interface or endpoint is in use by a kernel driver, another program, or this one.
+    Busy,
+    /// The user may not open the device (Linux: the device node's permissions; see the README).
+    PermissionDenied,
+    /// The device, configuration, interface, alternate setting or endpoint does not exist.
+    NotFound,
+    /// The operating system cannot do this (for instance a reset on Windows).
+    Unsupported,
+    /// A blocking call ran out of time.
+    TimedOut,
+    /// The call was cancelled.
+    Cancelled,
+    /// An argument was out of range (a buffer too long for a control transfer, an endpoint of the wrong type).
+    InvalidArgument,
+    /// An allocation failed.
+    NoMemory,
+    /// Anything else; `code` holds the operating system's value.
+    Other,
+}
+
+/// What was being done when a UsbError happened, so that a message can say it without a string per error.
+public enum Operation {
+    Enumerate,
+    Open,
+    ReadDescriptors,
+    SetConfiguration,
+    Reset,
+    DetachDriver,
+    AttachDriver,
+    ClaimInterface,
+    SetAltSetting,
+    OpenEndpoint,
+    ControlTransfer,
+    Transfer,
+    ClearHalt,
+    Hotplug,
+    EventLoop,
+}
+
+/// A failure of a control-plane operation: what kind, during what, and the operating system's code (`errno` on
+/// Linux, an `IOReturn` on macOS, a Win32 error on Windows; 0 when there is none). Copy, and no allocation.
+public struct UsbError {
+    public kind: ErrorKind;
+    public operation: Operation;
+    public code: i32;
+
+    public fn create(kind: ErrorKind, operation: Operation, code: i32) -> UsbError =>
+        UsbError { kind: kind, operation: operation, code: code };
+
+    public fn noMemory(operation: Operation) -> UsbError =>
+        UsbError { kind: ErrorKind.NoMemory, operation: operation, code: 0 };
+
+    /// The error kind in words.
+    public fn message(borrow this) -> StringView => kindText(this.kind);
+
+    /// The operation in words.
+    public fn during(borrow this) -> StringView => operationText(this.operation);
+
+    /// "<operation>: <kind> (OS error <code>)" into `w`.
+    public fn write<region r>(borrow this, w: borrow mut TextWriter<r>) {
+        w.text(operationText(this.operation));
+        w.text(": ");
+        w.text(kindText(this.kind));
+        if (this.code != 0) {
+            w.text(" (OS error 0x");
+            w.hex((truncate<u32>(this.code)) as u64, 8);
+            w.text(")");
+        }
+    }
+}
+
+/// The words for an ErrorKind.
+public fn kindText(kind: ErrorKind) -> StringView => match (kind) {
+    ErrorKind.Disconnected => "device disconnected",
+    ErrorKind.Busy => "in use by a kernel driver or another program",
+    ErrorKind.PermissionDenied => "permission denied",
+    ErrorKind.NotFound => "not found",
+    ErrorKind.Unsupported => "not supported on this platform",
+    ErrorKind.TimedOut => "timed out",
+    ErrorKind.Cancelled => "cancelled",
+    ErrorKind.InvalidArgument => "invalid argument",
+    ErrorKind.NoMemory => "out of memory",
+    ErrorKind.Other => "failed",
+};
+
+fn operationText(operation: Operation) -> StringView => match (operation) {
+    Operation.Enumerate => "enumerating devices",
+    Operation.Open => "opening the device",
+    Operation.ReadDescriptors => "reading descriptors",
+    Operation.SetConfiguration => "setting the configuration",
+    Operation.Reset => "resetting the device",
+    Operation.DetachDriver => "detaching the kernel driver",
+    Operation.AttachDriver => "attaching the kernel driver",
+    Operation.ClaimInterface => "claiming the interface",
+    Operation.SetAltSetting => "setting the alternate setting",
+    Operation.OpenEndpoint => "opening the endpoint",
+    Operation.ControlTransfer => "control transfer",
+    Operation.Transfer => "transfer",
+    Operation.ClearHalt => "clearing the halt",
+    Operation.Hotplug => "watching for devices",
+    Operation.EventLoop => "starting the event loop",
+};
+
+/// The outcome of one data transfer, nusb's TransferError plus success. A transfer can move some bytes and still
+/// fail or be cancelled: `Completion.actualLength` says how many.
+public enum TransferStatus {
+    Success,
+    /// Cancelled (by `cancelAll`, a dropped endpoint or a timeout).
+    Cancelled,
+    /// The endpoint stalled: the device's way of saying no. Clear it with `Endpoint.clearHalt`.
+    Stall,
+    Disconnected,
+    /// A hardware fault or protocol error (CRC, babble, overflow).
+    Fault,
+    /// The OS refused the transfer's arguments (a length that is not a multiple of the packet size, …).
+    InvalidArgument,
+    /// The ring of in-flight transfers was full; nothing was submitted.
+    QueueFull,
+    /// Anything else; the completion's `code` has the OS's value.
+    Unknown,
+}
+
+/// The words for a TransferStatus.
+public fn statusText(status: TransferStatus) -> StringView => match (status) {
+    TransferStatus.Success => "completed",
+    TransferStatus.Cancelled => "cancelled",
+    TransferStatus.Stall => "endpoint stalled",
+    TransferStatus.Disconnected => "device disconnected",
+    TransferStatus.Fault => "hardware fault or protocol violation",
+    TransferStatus.InvalidArgument => "invalid or unsupported argument",
+    TransferStatus.QueueFull => "too many transfers in flight",
+    TransferStatus.Unknown => "unknown transfer error",
+};
+
+/// A failed transfer as a UsbError, for the convenience calls (`read`, `write`, `controlIn`) that return one.
+public fn transferError(status: TransferStatus, code: i32, operation: Operation) -> UsbError {
+    let kind = match (status) {
+        TransferStatus.Success => ErrorKind.Other,
+        TransferStatus.Cancelled => ErrorKind.Cancelled,
+        TransferStatus.Stall => ErrorKind.Other,
+        TransferStatus.Disconnected => ErrorKind.Disconnected,
+        TransferStatus.Fault => ErrorKind.Other,
+        TransferStatus.InvalidArgument => ErrorKind.InvalidArgument,
+        TransferStatus.QueueFull => ErrorKind.Busy,
+        TransferStatus.Unknown => ErrorKind.Other,
+    };
+    return UsbError { kind: kind, operation: operation, code: code };
+}
