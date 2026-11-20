@@ -18,7 +18,7 @@ otherwise; Linux checks on Ubuntu 24.04 x86-64 (gcc), Windows checks on Windows 
 | F10 | `ceesafec test` shows a passing test's output only with `--format json` | papercut | fixed in 0.79.0 (`--show-output`, ADR 0185); the README says to use it |
 | F11 | an imported C static needs a header that declares it, and a system header also declares the functions this package declares with other pointer types, which C then rejects | gap | open; worked around |
 | F12 | ceesafec 0.78.1's Windows runtime warns in every build (`-Wsign-conversion`, `ceesafe_rt_io.c:375`) | build noise | fixed in 0.79.1 |
-| F13 | `ceesafec build` in a `kind = "library"` package fails with N0300, "an executable needs a 'main' function" | papercut | open |
+| F13 | `ceesafec build` in a `kind = "library"` package fails with N0300, "an executable needs a 'main' function" | papercut | fixed in 0.80.2 (ADR 0187) |
 
 ## F1. A slice field passed to a call inside a returned struct literal is taken as a loan of `this`
 
@@ -190,8 +190,7 @@ the first file: `src/buffer.cee:1:1: error[N0300]: an executable needs a 'main' 
 The manifest already says the package has no `main`, and the error points at a file that has nothing to do with it.
 `ceesafec build --emit lib` works.
 
-**Here:** nothing to change; `ceesafec check` and `ceesafec test` are what a library runs, and the examples build
-executables.
+**Fixed** in ceesafec 0.80.2 (ADR 0187): `ceesafec build` here writes `out/usb.a` and the C headers beside it.
 
 **Wanted:** in a library package, `build` with no `--emit` makes what a library makes (`--emit lib`, or a check that
 says so), or N0300 names the manifest's `kind` and suggests `--emit lib` instead of pointing at the first source file.
