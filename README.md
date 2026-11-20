@@ -12,7 +12,7 @@ CeeSafe's ownership model to remove the C# version's per-transfer costs.
 | Windows | WinUSB | cfgmgr32 + hub IOCTLs | one I/O completion port thread | CM_Register_Notification |
 
 No libusb, no C library beyond the OS's own. The C in the package is `src/platform/native.c`: `errno` (a C macro)
-and two tracing helpers. Needs ceesafec 0.79.0 or later.
+and two tracing helpers. Needs ceesafec 0.79.1 or later.
 
 ## Quick start
 

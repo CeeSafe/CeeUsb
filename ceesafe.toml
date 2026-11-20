@@ -2,7 +2,7 @@
 name = "usb"
 version = "0.1.0"
 kind = "library"
-ceesafec = ">=0.79.0"
+ceesafec = ">=0.79.1"
 # Endpoint rings, buffers and device handles hold native pointers shared with the event-loop thread; they are
 # declared @threadSafe (ADR 0025). Every such type says why in its doc comment.
 trusted = true

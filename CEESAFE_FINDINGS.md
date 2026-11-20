@@ -17,7 +17,7 @@ otherwise; Linux checks on Ubuntu 24.04 x86-64 (gcc), Windows checks on Windows 
 | F9 | the generated C draws compiler warnings: unused labels, `-Wreturn-type`, `-Wmaybe-uninitialized` | build noise | fixed in 0.79.0 |
 | F10 | `ceesafec test` shows a passing test's output only with `--format json` | papercut | fixed in 0.79.0 (`--show-output`, ADR 0185); the README says to use it |
 | F11 | an imported C static needs a header that declares it, and a system header also declares the functions this package declares with other pointer types, which C then rejects | gap | open; worked around |
-| F12 | ceesafec 0.78.1's Windows runtime warns in every build (`-Wsign-conversion`, `ceesafe_rt_io.c:375`) | build noise | open |
+| F12 | ceesafec 0.78.1's Windows runtime warns in every build (`-Wsign-conversion`, `ceesafe_rt_io.c:375`) | build noise | fixed in 0.79.1 |
 
 ## F1. A slice field passed to a call inside a returned struct literal is taken as a loan of `this`
 
@@ -179,5 +179,5 @@ or a way to name CF's pointer typedefs so the package's declarations can match t
 read-only files: `attributes & ~FILE_ATTRIBUTE_READONLY` complements an `int` and converts -2 to `DWORD`, which
 `-Wsign-conversion` reports. `~(DWORD)FILE_ATTRIBUTE_READONLY` is the fix.
 
-**Here:** nothing to do in the package; the warning is printed and the build succeeds.
+**Fixed** in ceesafec 0.79.1 (the complement is of a `DWORD`); the manifest needs 0.79.1, so Windows builds are warning-free.
 
