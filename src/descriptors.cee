@@ -271,11 +271,9 @@ public struct InterfaceGroup<region r> {
 
     /// The alternate settings, in the order the configuration lists them.
     public fn altSettings(borrow this) -> InterfaceFilterIter<r> {
-        let body = this.body;
-        let number = this.number;
         return InterfaceFilterIter {
-            inner: InterfaceIter { groups: GroupIter.create(body, DESCRIPTOR_INTERFACE, INTERFACE_MIN) },
-            number: number,
+            inner: InterfaceIter { groups: GroupIter.create(this.body, DESCRIPTOR_INTERFACE, INTERFACE_MIN) },
+            number: this.number,
         };
     }
 

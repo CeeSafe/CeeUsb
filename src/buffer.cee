@@ -1,7 +1,6 @@
 // Transfer buffers. A Buffer is owned by the caller, moved into the endpoint by `submit`, and moved back out in
 // the Completion, so a streaming loop reuses the same few buffers forever with no allocation and no pinning.
 
-@header("usb_os.h")
 extern "C" {}
 
 const PROT_READ_WRITE: i32 = 3;
@@ -42,7 +41,7 @@ public struct Buffer {
     /// A buffer over usbfs-mapped memory, or null if the mapping failed (old kernels, no memory).
     /// Safety: mmap of a usbfs descriptor; the mapping is owned by the Buffer and unmapped in its drop.
     fn mapUsbfs(fd: i32, capacity: usize) -> Buffer? {
-        if (cfg("USB_OS_POSIX")) {
+        if (cfg("target.unix")) {
             let p = unsafe { mmap(0 as *mut void, capacity, PROT_READ_WRITE, MAP_SHARED, fd, 0) };
             // MAP_FAILED is (void *)-1.
             if (p.isNull() || (p as usize) == 0usize.wrappingSub(1)) {
@@ -126,7 +125,7 @@ public struct Buffer {
     /// Safety: the mapping is this buffer's own; nothing else refers to it once the buffer is dropped (a buffer in
     /// flight is owned by its endpoint, which never drops it before the transfer is reaped).
     drop {
-        if (cfg("USB_OS_POSIX")) {
+        if (cfg("target.unix")) {
             if (!this.mapped.isNull()) {
                 unsafe { munmap(this.mapped as *mut void, this.capacity); }
             }

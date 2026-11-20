@@ -20,7 +20,7 @@ public struct Watcher {
             }
         };
         var w = Watcher { channel: channel.clone(), linuxSink: null, linuxTarget: null, mac: null, win: null };
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             let sink = match (Box.create(HotplugSink { channel: channel.clone() })) {
                 Ok(s) => s,
                 Err(_) => {
@@ -32,7 +32,7 @@ public struct Watcher {
             w.linuxSink = Some(sink);
             w.linuxTarget = Some(target);
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             var watch = match (Box.create(
                 MacWatch { channel: channel.clone(), port: 0 as *void, arrived: 0, left: 0 },
             )) {
@@ -44,7 +44,7 @@ public struct Watcher {
             macWatch(mut watch)?;
             w.mac = Some(watch);
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             var watch = match (Box.create(WinWatch { channel: channel.clone(), handle: 0 as *mut void })) {
                 Ok(m) => m,
                 Err(_) => {

@@ -10,27 +10,26 @@
 //   version allocated a NativeOverlapped and looked its context up in a global ConcurrentDictionary.
 // - cancelAll is one WinUsb_AbortPipe, not a CancelIoEx per transfer.
 
-@header("usb_os.h")
 extern "C" {
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Get_Device_Interface_List_SizeW(length: *mut u32, guid: *Guid, device: *u16, flags: u32) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Get_Device_Interface_ListW(guid: *Guid, device: *u16, buffer: *mut u16, length: u32, flags: u32) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Locate_DevNodeW(devinst: *mut u32, device: *u16, flags: u32) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Get_Parent(parent: *mut u32, devinst: u32, flags: u32) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Get_Child(child: *mut u32, devinst: u32, flags: u32) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Get_Sibling(sibling: *mut u32, devinst: u32, flags: u32) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Get_DevNode_PropertyW(
         devinst: u32,
@@ -40,7 +39,7 @@ extern "C" {
         size: *mut u32,
         flags: u32,
     ) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Get_Device_Interface_PropertyW(
         path: *u16,
@@ -50,7 +49,7 @@ extern "C" {
         size: *mut u32,
         flags: u32,
     ) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CM_Open_DevNode_Key(
         devinst: u32,
@@ -60,16 +59,16 @@ extern "C" {
         key: *mut *mut void,
         flags: u32,
     ) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn CM_Register_Notification(
         filter: *mut u8,
         context: *mut void,
         callback: extern "C" fn(*mut void, *mut void, u32, *mut u8, u32) -> u32,
         handle: *mut *mut void,
     ) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn CM_Unregister_Notification(handle: *mut void) -> u32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn RegQueryValueExW(
         key: *mut void,
@@ -79,10 +78,10 @@ extern "C" {
         data: *mut u8,
         size: *mut u32,
     ) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn RegCloseKey(key: *mut void) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn CreateFileW(
         path: *u16,
         access: u32,
@@ -92,7 +91,7 @@ extern "C" {
         flags: u32,
         template: *mut void,
     ) -> *mut void;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn DeviceIoControl(
         device: *mut void,
         code: u32,
@@ -103,10 +102,10 @@ extern "C" {
         returned: *mut u32,
         overlapped: *mut void,
     ) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn CreateIoCompletionPort(file: *mut void, port: *mut void, key: usize, threads: u32) -> *mut void;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn GetQueuedCompletionStatus(
         port: *mut void,
         bytes: *mut u32,
@@ -114,17 +113,17 @@ extern "C" {
         overlapped: *mut *mut void,
         ms: u32,
     ) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn WinUsb_Initialize(file: *mut void, handle: *mut *mut void) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn WinUsb_Free(handle: *mut void) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn WinUsb_GetAssociatedInterface(handle: *mut void, index: u8, associated: *mut *mut void) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn WinUsb_SetPipePolicy(handle: *mut void, pipe: u8, policy: u32, length: u32, value: *mut void) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn WinUsb_ControlTransfer(
         handle: *mut void,
         setup: SetupPacket,
@@ -133,7 +132,7 @@ extern "C" {
         transferred: *mut u32,
         overlapped: *mut void,
     ) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn WinUsb_ReadPipe(
         handle: *mut void,
@@ -143,7 +142,7 @@ extern "C" {
         transferred: *mut u32,
         overlapped: *mut void,
     ) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn WinUsb_WritePipe(
         handle: *mut void,
@@ -153,14 +152,14 @@ extern "C" {
         transferred: *mut u32,
         overlapped: *mut void,
     ) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn WinUsb_ResetPipe(handle: *mut void, pipe: u8) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn WinUsb_AbortPipe(handle: *mut void, pipe: u8) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     fn WinUsb_SetCurrentAlternateSetting(handle: *mut void, setting: u8) -> i32;
-    @cfg("USB_OS_WINDOWS")
+    @cfg("target.windows")
     @effects()
     fn WinUsb_QueryInterfaceSettings(handle: *mut void, index: u8, descriptor: *mut u8) -> i32;
 }
@@ -226,20 +225,32 @@ const DESCRIPTOR_HEADER: usize = 12;
 const DESCRIPTOR_MAX: usize = 4095;
 
 /// GUID_DEVINTERFACE_USB_DEVICE
-fn guidUsbDevice() -> Guid =>
-    Guid { data1: 0xA5DCBF10, data2: 0x6530, data3: 0x11D2, data4: [0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED] };
+const GUID_USB_DEVICE: Guid = Guid {
+    data1: 0xA5DCBF10,
+    data2: 0x6530,
+    data3: 0x11D2,
+    data4: [0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED],
+};
 /// GUID_DEVINTERFACE_USB_HUB
-fn guidUsbHub() -> Guid =>
-    Guid { data1: 0xF18A0E88, data2: 0xC30C, data3: 0x11D0, data4: [0x88, 0x15, 0x00, 0xA0, 0xC9, 0x06, 0xBE, 0xD8] };
+const GUID_USB_HUB: Guid = Guid {
+    data1: 0xF18A0E88,
+    data2: 0xC30C,
+    data3: 0x11D0,
+    data4: [0x88, 0x15, 0x00, 0xA0, 0xC9, 0x06, 0xBE, 0xD8],
+};
 
-fn pkeyDevice() -> Guid =>
-    Guid { data1: 0xA45C254E, data2: 0xDF1C, data3: 0x4EFD, data4: [0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0] };
-fn keyHardwareIds() -> DevPropKey => DevPropKey { fmtid: pkeyDevice(), pid: 3 };
-fn keyDeviceDesc() -> DevPropKey => DevPropKey { fmtid: pkeyDevice(), pid: 2 };
-fn keyService() -> DevPropKey => DevPropKey { fmtid: pkeyDevice(), pid: 6 };
-fn keyAddress() -> DevPropKey => DevPropKey { fmtid: pkeyDevice(), pid: 30 };
-fn keyLocationPaths() -> DevPropKey => DevPropKey { fmtid: pkeyDevice(), pid: 37 };
-fn keyInstanceId() -> DevPropKey => DevPropKey {
+const PKEY_DEVICE: Guid = Guid {
+    data1: 0xA45C254E,
+    data2: 0xDF1C,
+    data3: 0x4EFD,
+    data4: [0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0],
+};
+const KEY_HARDWARE_IDS: DevPropKey = DevPropKey { fmtid: PKEY_DEVICE, pid: 3 };
+const KEY_DEVICE_DESC: DevPropKey = DevPropKey { fmtid: PKEY_DEVICE, pid: 2 };
+const KEY_SERVICE: DevPropKey = DevPropKey { fmtid: PKEY_DEVICE, pid: 6 };
+const KEY_ADDRESS: DevPropKey = DevPropKey { fmtid: PKEY_DEVICE, pid: 30 };
+const KEY_LOCATION_PATHS: DevPropKey = DevPropKey { fmtid: PKEY_DEVICE, pid: 37 };
+const KEY_INSTANCE_ID: DevPropKey = DevPropKey {
     fmtid: Guid {
         data1: 0x78C34FC8,
         data2: 0x104A,
@@ -248,7 +259,7 @@ fn keyInstanceId() -> DevPropKey => DevPropKey {
     },
     pid: 256,
 };
-fn keyBusReportedDesc() -> DevPropKey => DevPropKey {
+const KEY_BUS_REPORTED_DESC: DevPropKey = DevPropKey {
     fmtid: Guid {
         data1: 0x540B947E,
         data2: 0x8B40,
@@ -355,7 +366,7 @@ fn instanceIdHash(id: StringView) -> u64 {
 /// A property of a device node into `into`; its size, or null if absent or of another type.
 /// Safety: CM writes at most `size` bytes.
 fn nodeProperty(devinst: u32, key: DevPropKey, kind: u32, into: SliceMut<u8>) -> usize? {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var actual: u32 = 0;
         var size = truncate<u32>(into.length);
         let k = key;
@@ -395,7 +406,7 @@ fn nodeU32(devinst: u32, key: DevPropKey) -> u32? {
 
 /// Safety: as nodeProperty.
 fn parentOf(devinst: u32) -> u32? {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var parent: u32 = 0;
         if (unsafe { CM_Get_Parent(borrow mut parent as *mut u32, devinst, 0) } == CR_SUCCESS) {
             return Some(parent);
@@ -407,7 +418,7 @@ fn parentOf(devinst: u32) -> u32? {
 /// The device node of an instance ID (also a just-removed one).
 /// Safety: the wide string is NUL-terminated.
 fn locate(instanceId: StringView) -> u32? {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var w = Vector<u16>.create();
         if (wide(instanceId, mut w).isErr()) {
             return null;
@@ -423,7 +434,7 @@ fn locate(instanceId: StringView) -> u32? {
 /// The device interface paths of a class, for one device (`device`, an instance ID) or all (empty).
 /// Safety: the list is sized first and retried while it grows.
 fn interfacePaths(guid: Guid, device: StringView, out: borrow mut Vector<String>) -> Result<void, AllocError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var id = Vector<u16>.create();
         let g = guid;
         let hasDevice = device.length > 0;
@@ -479,13 +490,13 @@ fn interfacePaths(guid: Guid, device: StringView, out: borrow mut Vector<String>
 /// The instance ID behind a device interface path.
 /// Safety: as nodeProperty; the path is NUL-terminated.
 fn interfaceInstanceId(path: StringView) -> Result<String?, AllocError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var w = Vector<u16>.create();
         wide(path, mut w)?;
         var buffer = [0u8; 1024];
         var kind: u32 = 0;
         var size: u32 = 1024;
-        let k = keyInstanceId();
+        let k = KEY_INSTANCE_ID;
         if (unsafe { CM_Get_Device_Interface_PropertyW(
             w.view().ptr,
             borrow k as *DevPropKey,
@@ -504,7 +515,7 @@ fn interfaceInstanceId(path: StringView) -> Result<String?, AllocError> {
 /// The interface number in a composite child's hardware IDs ("...&MI_02").
 fn compositeNumber(devinst: u32) -> u8? {
     var buffer = [0u8; 2048];
-    let n = nodeProperty(devinst, keyHardwareIds(), DEVPROP_TYPE_STRING_LIST, mut buffer[..])?;
+    let n = nodeProperty(devinst, KEY_HARDWARE_IDS, DEVPROP_TYPE_STRING_LIST, mut buffer[..])?;
     var text = String.create();
     if (appendUtf16(buffer[0..n], mut text).isErr()) {
         return null;
@@ -520,7 +531,7 @@ fn compositeNumber(devinst: u32) -> u8? {
 /// The bus ID and port chain of the first location path with a USB root ("...#USBROOT(0)#USB(3)#USB(1)").
 fn parseLocation(devinst: u32, busId: borrow mut String, chain: borrow mut Vector<u8>) -> Result<void, AllocError> {
     var buffer = [0u8; 2048];
-    let n = match (nodeProperty(devinst, keyLocationPaths(), DEVPROP_TYPE_STRING_LIST, mut buffer[..])) {
+    let n = match (nodeProperty(devinst, KEY_LOCATION_PATHS, DEVPROP_TYPE_STRING_LIST, mut buffer[..])) {
         Some(n) => n,
         null => {
             return Ok();
@@ -579,15 +590,15 @@ struct Hub {
     /// Opens the hub that is device node `hub`.
     /// Safety: the path is NUL-terminated; the handle is owned by the Hub.
     fn open(hub: u32) -> Result<Hub?, AllocError> {
-        if (cfg("USB_OS_WINDOWS")) {
-            let id = match (nodeString(hub, keyInstanceId())?) {
+        if (cfg("target.windows")) {
+            let id = match (nodeString(hub, KEY_INSTANCE_ID)?) {
                 Some(s) => s,
                 null => {
                     return Ok(null);
                 }
             };
             var paths = Vector<String>.create();
-            interfacePaths(guidUsbHub(), id.view(), mut paths)?;
+            interfacePaths(GUID_USB_HUB, id.view(), mut paths)?;
             if (paths.length == 0) {
                 return Ok(null);
             }
@@ -614,7 +625,7 @@ struct Hub {
     /// device is connected there.
     /// Safety: the IOCTL reads and writes the local buffers only.
     fn port(borrow this, port: u32) -> PortInfo? {
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             var info = [0u8; CONN_INFO_SIZE];
             info[..].writeLE(0, port);
             var returned: u32 = 0;
@@ -689,7 +700,7 @@ struct Hub {
     /// `out` and returns its length, or null.
     /// Safety: the IOCTL reads and writes the local buffer only.
     fn descriptor(borrow this, port: u32, kind: u8, index: u8, language: u16, out: borrow mut Vector<u8>) -> usize? {
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             var request = Vector<u8>.create();
             if (request.resize(DESCRIPTOR_HEADER + DESCRIPTOR_MAX, 0).isErr()) {
                 return null;
@@ -726,7 +737,7 @@ struct Hub {
 
     /// Safety: the handle is this Hub's own.
     drop {
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             unsafe { CloseHandle(this.handle); }
         }
     }
@@ -775,8 +786,8 @@ fn winListDevices(out: borrow mut Vector<DeviceInfo>) -> Result<void, UsbError> 
 
 fn listInner(out: borrow mut Vector<DeviceInfo>) -> Result<void, AllocError> {
     var paths = Vector<String>.create();
-    interfacePaths(guidUsbDevice(), "", mut paths)?;
-    interfacePaths(guidUsbHub(), "", mut paths)?;
+    interfacePaths(GUID_USB_DEVICE, "", mut paths)?;
+    interfacePaths(GUID_USB_HUB, "", mut paths)?;
     var hubs = HubCache.create();
     for (path in paths.view()) {
         let id = match (interfaceInstanceId(path.view())?) {
@@ -815,7 +826,7 @@ fn winProbe(instanceId: StringView, hubs: borrow mut HubCache) -> Result<DeviceI
             return Ok(null);
         }
     };
-    let port = match (nodeU32(devinst, keyAddress())) {
+    let port = match (nodeU32(devinst, KEY_ADDRESS)) {
         Some(p) => p,
         null => {
             return Ok(null);
@@ -880,14 +891,14 @@ fn winProbe(instanceId: StringView, hubs: borrow mut HubCache) -> Result<DeviceI
         }
         null => {}
     }
-    let driver = nodeString(devinst, keyService())?;
+    let driver = nodeString(devinst, KEY_SERVICE)?;
     let composite = match (borrow driver) {
         Some(s) => s.view().equalsIgnoreAsciiCase("usbccgp"),
         null => false,
     };
     if (composite) {
         // A composite device's functions are child nodes, which carry the interface names.
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             var child: u32 = 0;
             var ok = unsafe { CM_Get_Child(borrow mut child as *mut u32, devinst, 0) } == CR_SUCCESS;
             while (ok) {
@@ -895,7 +906,7 @@ fn winProbe(instanceId: StringView, hubs: borrow mut HubCache) -> Result<DeviceI
                     Some(n) => {
                         for (i in 0..interfaces.length) {
                             if (interfaces[i].number == n && interfaces[i].name.isNull()) {
-                                interfaces[i].name = nodeString(child, keyBusReportedDesc())?;
+                                interfaces[i].name = nodeString(child, KEY_BUS_REPORTED_DESC)?;
                             }
                         }
                     }
@@ -925,14 +936,14 @@ fn winProbe(instanceId: StringView, hubs: borrow mut HubCache) -> Result<DeviceI
         speed: pi.speed,
         // Windows does not cache the manufacturer string.
         manufacturer: null,
-        product: nodeString(devinst, keyBusReportedDesc())?,
+        product: nodeString(devinst, KEY_BUS_REPORTED_DESC)?,
         serialNumber: serial,
         interfaces: interfaces,
         path: String.from(instanceId)?,
         busNumber: 0,
         registryId: 0,
         port: port,
-        parentId: nodeString(parent, keyInstanceId())?,
+        parentId: nodeString(parent, KEY_INSTANCE_ID)?,
         locationId: 0,
         driver: driver,
     }));
@@ -951,7 +962,7 @@ fn winListBuses(out: borrow mut Vector<BusInfo>) -> Result<void, UsbError> {
 
 fn busesInner(out: borrow mut Vector<BusInfo>) -> Result<void, AllocError> {
     var paths = Vector<String>.create();
-    interfacePaths(guidUsbHub(), "", mut paths)?;
+    interfacePaths(GUID_USB_HUB, "", mut paths)?;
     for (path in paths.view()) {
         let id = match (interfaceInstanceId(path.view())?) {
             Some(i) => i,
@@ -969,7 +980,7 @@ fn busesInner(out: borrow mut Vector<BusInfo>) -> Result<void, AllocError> {
             }
         };
         let controllerDriver = match (parentOf(devinst)) {
-            Some(p) => nodeString(p, keyService())?,
+            Some(p) => nodeString(p, KEY_SERVICE)?,
             null => null,
         };
         let kind = match (borrow controllerDriver) {
@@ -985,8 +996,8 @@ fn busesInner(out: borrow mut Vector<BusInfo>) -> Result<void, AllocError> {
         out.push(BusInfo {
             busId: busId,
             controllerType: kind,
-            driver: nodeString(devinst, keyService())?,
-            name: nodeString(devinst, keyDeviceDesc())?,
+            driver: nodeString(devinst, KEY_SERVICE)?,
+            name: nodeString(devinst, KEY_DEVICE_DESC)?,
             path: id,
             registryId: 0,
             locationId: 0,
@@ -1019,7 +1030,7 @@ struct WinDevice {
 
     /// Safety: every interface released its file before the device core drops; this closes any left.
     drop {
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             var guard = this.files.lock();
             let files = guard.data();
             for (f in files.view()) {
@@ -1058,7 +1069,7 @@ fn winOpen(info: borrow DeviceInfo) -> Result<WinOpened, UsbError> {
         }
     };
     let parent = parentOf(devinst) ?? 0;
-    let port = nodeU32(devinst, keyAddress()) ?? 0;
+    let port = nodeU32(devinst, KEY_ADDRESS) ?? 0;
     let hub = match (Hub.open(parent)) {
         Ok(Some(h)) => h,
         Ok(null) => {
@@ -1107,7 +1118,7 @@ fn winGetDescriptor(
         }
     };
     let parent = parentOf(w.devinst) ?? 0;
-    let port = nodeU32(w.devinst, keyAddress()) ?? 0;
+    let port = nodeU32(w.devinst, KEY_ADDRESS) ?? 0;
     let hub = match (Hub.open(parent)) {
         Ok(Some(h)) => h,
         Ok(null) => {
@@ -1140,7 +1151,7 @@ fn winActiveConfiguration(core: borrow DeviceCore) -> u8 => match (borrow core.w
 /// DeviceInterfaceGUIDs) when usbccgp splits it.
 /// Safety: child iteration on live device nodes.
 fn winPathFor(devinst: u32, number: u8, path: borrow mut String) -> Result<u8, UsbError> {
-    let driver = match (nodeString(devinst, keyService())) {
+    let driver = match (nodeString(devinst, KEY_SERVICE)) {
         Ok(d) => d,
         Err(_) => {
             return Err(UsbError.noMemory(Operation.ClaimInterface));
@@ -1152,13 +1163,13 @@ fn winPathFor(devinst: u32, number: u8, path: borrow mut String) -> Result<u8, U
     };
     var paths = Vector<String>.create();
     if (name.equalsIgnoreAsciiCase("winusb")) {
-        let id = match (nodeString(devinst, keyInstanceId())) {
+        let id = match (nodeString(devinst, KEY_INSTANCE_ID)) {
             Ok(Some(i)) => i,
             _ => {
                 return Err(UsbError.create(ErrorKind.Disconnected, Operation.ClaimInterface, 0));
             }
         };
-        if (interfacePaths(guidUsbDevice(), id.view(), mut paths).isErr() || paths.length == 0) {
+        if (interfacePaths(GUID_USB_DEVICE, id.view(), mut paths).isErr() || paths.length == 0) {
             return Err(UsbError.create(ErrorKind.NotFound, Operation.ClaimInterface, 0));
         }
         if (path.append(paths[0].view()).isErr()) {
@@ -1174,7 +1185,7 @@ fn winPathFor(devinst: u32, number: u8, path: borrow mut String) -> Result<u8, U
     // several interfaces in one function).
     var best: u32 = 0;
     var bestNumber: i32 = -1;
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var child: u32 = 0;
         var ok = unsafe { CM_Get_Child(borrow mut child as *mut u32, devinst, 0) } == CR_SUCCESS;
         while (ok) {
@@ -1195,7 +1206,7 @@ fn winPathFor(devinst: u32, number: u8, path: borrow mut String) -> Result<u8, U
     if (bestNumber < 0) {
         return Err(UsbError.create(ErrorKind.NotFound, Operation.ClaimInterface, 0));
     }
-    let childDriver = match (nodeString(best, keyService())) {
+    let childDriver = match (nodeString(best, KEY_SERVICE)) {
         Ok(d) => d,
         Err(_) => {
             return Err(UsbError.noMemory(Operation.ClaimInterface));
@@ -1215,7 +1226,7 @@ fn winPathFor(devinst: u32, number: u8, path: borrow mut String) -> Result<u8, U
     if (!registryInterfaceGuid(best, mut guid)) {
         return Err(UsbError.create(ErrorKind.Unsupported, Operation.ClaimInterface, 0));
     }
-    let childId = match (nodeString(best, keyInstanceId())) {
+    let childId = match (nodeString(best, KEY_INSTANCE_ID)) {
         Ok(Some(i)) => i,
         _ => {
             return Err(UsbError.create(ErrorKind.Disconnected, Operation.ClaimInterface, 0));
@@ -1239,7 +1250,7 @@ fn winPathFor(devinst: u32, number: u8, path: borrow mut String) -> Result<u8, U
 /// The first DeviceInterfaceGUIDs (or DeviceInterfaceGUID) value of a function's hardware registry key.
 /// Safety: the registry writes at most `size` bytes; the key is closed on every path.
 fn registryInterfaceGuid(devinst: u32, out: borrow mut String) -> bool {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var key: *mut void = 0 as *mut void;
         if (unsafe { CM_Open_DevNode_Key(devinst, 0x20019, 0, 1, borrow mut key as *mut *mut void, 0) } != CR_SUCCESS) {
             return false;
@@ -1298,7 +1309,7 @@ fn parseGuid(text: StringView) -> Guid? {
 /// file's own, or an associated interface's).
 /// Safety: handles opened here are owned by the file list or the returned WinInterface.
 fn winClaim(core: borrow DeviceCore, number: u8) -> Result<WinInterface, UsbError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         let w = match (borrow core.win) {
             Some(w) => w,
             null => {
@@ -1407,7 +1418,7 @@ fn winClaim(core: borrow DeviceCore, number: u8) -> Result<WinInterface, UsbErro
 /// Closes a file nobody uses any more.
 /// Safety: the file's handles are owned by the list entry being removed.
 fn releaseFile(files: borrow mut Vector<WinFile>, at: usize) {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         if (files[at].users == 0) {
             let f = VectorEditing<WinFile>.swapRemove(files, at);
             unsafe {
@@ -1421,7 +1432,7 @@ fn releaseFile(files: borrow mut Vector<WinFile>, at: usize) {
 /// Releases a claimed interface's handle and, with its last user, its file.
 /// Safety: no transfer is in flight on the handle (its endpoints drained).
 fn winRelease(core: borrow DeviceCore, iface: borrow WinInterface) {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         if (!iface.isMain) {
             unsafe { WinUsb_Free(iface.handle); }
         }
@@ -1445,7 +1456,7 @@ fn winRelease(core: borrow DeviceCore, iface: borrow WinInterface) {
 /// bInterfaceNumber of a WinUSB handle's interface.
 /// Safety: WinUSB writes the 9-byte descriptor into the local buffer.
 fn interfaceNumberOf(handle: *mut void) -> u8? {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var d = [0u8; 9];
         if (unsafe { WinUsb_QueryInterfaceSettings(handle, 0, borrow mut d[0] as *mut u8) } != 0) {
             return Some(d[2]);
@@ -1461,7 +1472,7 @@ fn winHandle(core: borrow InterfaceCore) -> *mut void => match (borrow core.win)
 
 /// Safety: a live WinUSB handle.
 fn winSetAltSetting(core: borrow InterfaceCore, alt: u8) -> Result<void, UsbError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         if (unsafe { WinUsb_SetCurrentAlternateSetting(winHandle(core), alt) } == 0) {
             let e = lastError();
             return Err(
@@ -1488,7 +1499,7 @@ fn winControl(
     length: usize,
     timeoutMs: u32,
 ) -> Result<usize, UsbError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         let n = match (checkedTruncate<u16>(length)) {
             Some(v) => v,
             null => {
@@ -1539,7 +1550,7 @@ fn winControl(
 /// requires), and a short packet completes the transfer at once.
 /// Safety: a live WinUSB handle.
 fn winOpenPipe(core: borrow InterfaceCore, address: u8) {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         if ((address & 0x80) != 0) {
             var on: u8 = 1;
             if (unsafe { WinUsb_SetPipePolicy(
@@ -1558,7 +1569,7 @@ fn winOpenPipe(core: borrow InterfaceCore, address: u8) {
 /// Submits a pipe transfer with the slot's OVERLAPPED; failures complete the slot at once.
 /// Safety: as linuxSubmit; the OVERLAPPED (the slot's first 32 bytes) is zeroed before each use.
 fn winSubmit(core: borrow InterfaceCore, address: u8, slot: *mut Slot, buffer: *mut u8, length: usize) {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         let s = unsafe { Ptr.toBorrowMut(slot) };
         for (i in 0..4) {
             s.native[i] = 0;
@@ -1589,14 +1600,14 @@ fn winSubmit(core: borrow InterfaceCore, address: u8, slot: *mut Slot, buffer: *
 /// Aborts every transfer on a pipe; they complete through the port as Cancelled.
 /// Safety: a live WinUSB handle.
 fn winAbort(core: borrow InterfaceCore, address: u8) {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         unsafe { WinUsb_AbortPipe(winHandle(core), address); }
     }
 }
 
 /// Safety: a live WinUSB handle.
 fn winClearHalt(core: borrow InterfaceCore, address: u8) -> Result<void, UsbError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         if (unsafe { WinUsb_ResetPipe(winHandle(core), address) } == 0) {
             return Err(winError(Operation.ClearHalt));
         }
@@ -1613,7 +1624,7 @@ static WIN_PORT: AtomicU64 = AtomicU64.constant(0);
 /// The completion port, with its thread started once per process.
 /// Safety: plain Win32 calls.
 fn winLoop() -> Result<*mut void, UsbError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         loop {
             match (WIN_STATE.compareExchange(0, 1)) {
                 Ok(_) => {
@@ -1628,9 +1639,10 @@ fn winLoop() -> Result<*mut void, UsbError> {
                         return Err(winError(Operation.EventLoop));
                     }
                     WIN_PORT.store(port as usize as u64);
-                    if (!startThread(loopMain, winLoopMain)) {
+                    // The completion thread runs for the process; nothing joins it (ADR 0182).
+                    if (Thread.service("usb-iocp", move () => { winLoopMain(); }).isErr()) {
                         WIN_STATE.store(3);
-                        return Err(winError(Operation.EventLoop));
+                        return Err(UsbError.noMemory(Operation.EventLoop));
                     }
                     WIN_STATE.store(2);
                     return Ok(port);
@@ -1653,9 +1665,8 @@ fn winLoop() -> Result<*mut void, UsbError> {
 /// The completion thread: every dequeued OVERLAPPED is a ring slot.
 /// Safety: only transfers submitted with a slot's OVERLAPPED reach this port; the slot's ring is alive while it
 /// counts the transfer.
-@callback
-fn winLoopMain(argument: *mut void) -> u32 {
-    if (cfg("USB_OS_WINDOWS")) {
+fn winLoopMain() {
+    if (cfg("target.windows")) {
         let port = truncate<usize>(WIN_PORT.load()) as *mut void;
         loop {
             var bytes: u32 = 0;
@@ -1675,7 +1686,6 @@ fn winLoopMain(argument: *mut void) -> u32 {
             unsafe { completeSlot(overlapped as *mut Slot, statusFromWin32(e), bytes as usize, e); }
         }
     }
-    return 0;
 }
 
 // ---- Hotplug --------------------------------------------------------------------------------------------------
@@ -1690,11 +1700,11 @@ struct WinWatch {
 /// Safety: the filter is a local CM_NOTIFY_FILTER (416 bytes) for USB device interfaces; `watch` outlives the
 /// registration (winUnwatch unregisters first).
 fn winWatch(watch: borrow mut WinWatch) -> Result<void, UsbError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         var filter = [0u8; 416];
         filter[..].writeLE(0, 416u32);
         filter[..].writeLE(8, 0u32); // CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE
-        let g = guidUsbDevice();
+        let g = GUID_USB_DEVICE;
         filter[..].writeLE(16, g.data1);
         filter[..].writeLE(20, g.data2);
         filter[..].writeLE(22, g.data3);
@@ -1717,7 +1727,7 @@ fn winWatch(watch: borrow mut WinWatch) -> Result<void, UsbError> {
 
 /// Safety: unregistering waits for any callback in progress.
 fn winUnwatch(watch: borrow mut WinWatch) {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         if (!watch.handle.isNull()) {
             unsafe { CM_Unregister_Notification(watch.handle); }
             watch.handle = 0 as *mut void;

@@ -10,13 +10,13 @@ public struct Usb {
     /// Every connected device, from the OS's cache (no device I/O, no open).
     public fn listDevices() -> Result<Vector<DeviceInfo>, UsbError> {
         var out = Vector<DeviceInfo>.create();
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             linuxListDevices(mut out)?;
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macListDevices(mut out)?;
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             winListDevices(mut out)?;
         }
         return Ok(out);
@@ -25,13 +25,13 @@ public struct Usb {
     /// Every host controller.
     public fn listBuses() -> Result<Vector<BusInfo>, UsbError> {
         var out = Vector<BusInfo>.create();
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             linuxListBuses(mut out)?;
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macListBuses(mut out)?;
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             winListBuses(mut out)?;
         }
         return Ok(out);
@@ -117,7 +117,7 @@ struct DeviceCore {
 
     /// Safety: each handle is closed once; the Linux target leaves the loop (with its barrier) before the fd closes.
     drop {
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             match (borrow this.target) {
                 Some(t) => {
                     linuxClose(this.fd, t);
@@ -125,7 +125,7 @@ struct DeviceCore {
                 null => {}
             }
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             if (!this.mac.isNull()) {
                 macClose(this.mac, this.macExclusive);
             }
@@ -151,7 +151,7 @@ public struct Device {
             win: null,
             fake: false,
         };
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             var opened = linuxOpen(info.busNumber, info.address)?;
             core.fd = opened.fd;
             core.speed = opened.speed;
@@ -169,7 +169,7 @@ public struct Device {
                 return Err(UsbError.noMemory(Operation.Open));
             }
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             let opened = macOpen(info.registryId)?;
             core.mac = opened.device;
             core.macExclusive = opened.exclusive;
@@ -177,7 +177,7 @@ public struct Device {
             core.speed = opened.speed;
             core.blob = opened.blob;
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             let opened = winOpen(info)?;
             core.descriptor = opened.descriptor;
             core.speed = opened.speed;
@@ -234,7 +234,7 @@ public struct Device {
                 null => 0,
             };
         }
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             match (linuxActiveConfiguration(core.sysfsPath.view())) {
                 Some(v) => {
                     return v;
@@ -242,11 +242,11 @@ public struct Device {
                 null => {}
             }
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             // With one configuration and interfaces published, it is the active one: no device I/O (nusb's guess).
             return macActiveConfiguration(core.mac);
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             return winActiveConfiguration(core);
         }
         var it = ConfigurationIter.over(core.blob.view());
@@ -274,13 +274,13 @@ public struct Device {
     /// `setConfiguration(1)` before its interfaces appear.
     public fn setConfiguration(borrow this, value: u8) -> Result<void, UsbError> {
         let core = this.core.get();
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             return linuxSetConfiguration(core.fd, value);
         }
         if (core.fake) {
             return Ok();
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macRequireExclusive(core.mac, Operation.SetConfiguration)?;
             return macSetConfiguration(core.mac, value);
         }
@@ -305,10 +305,10 @@ public struct Device {
     /// Resets the device. Not available on Windows; on macOS the device re-enumerates with a new registry ID.
     public fn reset(borrow this) -> Result<void, UsbError> {
         let core = this.core.get();
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             return linuxReset(core.fd);
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macRequireExclusive(core.mac, Operation.Reset)?;
             return macReset(core.mac);
         }
@@ -317,7 +317,7 @@ public struct Device {
 
     /// Detaches the kernel driver bound to an interface (Linux; elsewhere it does nothing, as in nusb).
     public fn detachKernelDriver(borrow this, number: u8) -> Result<void, UsbError> {
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             return linuxDetach(this.core.get().fd, number);
         }
         return Ok();
@@ -325,7 +325,7 @@ public struct Device {
 
     /// Reattaches the kernel driver of an interface (Linux; elsewhere it does nothing).
     public fn attachKernelDriver(borrow this, number: u8) -> Result<void, UsbError> {
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             return linuxAttach(this.core.get().fd, number);
         }
         return Ok();
@@ -390,7 +390,7 @@ public struct Device {
         into: SliceMut<u8>,
         timeoutMs: u32,
     ) -> Result<usize, UsbError> {
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             return winGetDescriptor(this.core.get(), descriptorType, index, languageId, into);
         }
         return this.controlIn(getDescriptorRequest(descriptorType, index, languageId), into, timeoutMs);
@@ -453,10 +453,10 @@ fn deviceControl(
         }
     };
     let requestType = request.requestType(direction);
-    if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.linux")) {
         return linuxControl(core.fd, requestType, request, data, n, timeoutMs);
     }
-    if (cfg("USB_OS_MACOS")) {
+    if (cfg("target.macos")) {
         return macControl(core.mac, requestType, request, data, n, timeoutMs);
     }
     return Err(UsbError.create(ErrorKind.Unsupported, Operation.ControlTransfer, 0));
@@ -490,16 +490,16 @@ struct InterfaceCore {
         if (!this.live) {
             return;
         }
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             linuxRelease(device.fd, this.number);
             if (this.reattach) {
                 let _ = linuxAttach(device.fd, this.number);
             }
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macRelease(this.mac, this.macSource);
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             match (borrow this.win) {
                 Some(w) => {
                     winRelease(device, w);
@@ -534,7 +534,7 @@ public struct Interface {
         var failure: UsbError? = null;
         if (d.fake) {
             // Tests: nothing to claim.
-        } else if (cfg("USB_OS_LINUX")) {
+        } else if (cfg("target.linux")) {
             match (linuxClaim(d.fd, number, detach)) {
                 Ok() => {
                     core.reattach = detach;
@@ -544,7 +544,7 @@ public struct Interface {
                 }
             }
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             if (!d.fake) {
                 match (macClaim(d.mac, number)) {
                     Ok(c) => {
@@ -558,7 +558,7 @@ public struct Interface {
                 }
             }
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             if (!d.fake) {
                 match (winClaim(d, number)) {
                     Ok(w) => {
@@ -601,13 +601,13 @@ public struct Interface {
         if (core.endpoints.load() != 0) {
             return Err(UsbError.create(ErrorKind.Busy, Operation.SetAltSetting, 0));
         }
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             linuxSetInterface(core.device.get().fd, core.number, alt)?;
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macSetAltSetting(core.mac, alt)?;
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             winSetAltSetting(core, alt)?;
         }
         core.alt.store(alt as u32);
@@ -733,7 +733,7 @@ public struct Interface {
         }
         var pipe: u8 = 0;
         let fake = core.device.get().fake;
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             match (if (fake) Some(1u8) else macPipeRef(core.mac, address)) {
                 Some(p) => {
                     pipe = p;
@@ -747,7 +747,7 @@ public struct Interface {
         if ((core.endpoints.fetchOr(bit) & bit) != 0) {
             return Err(UsbError.create(ErrorKind.Busy, Operation.OpenEndpoint, 0));
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             if (!fake) {
                 winOpenPipe(core, address);
             }
@@ -792,7 +792,7 @@ fn interfaceControl(
     length: usize,
     timeoutMs: u32,
 ) -> Result<usize, UsbError> {
-    if (cfg("USB_OS_WINDOWS")) {
+    if (cfg("target.windows")) {
         return winControl(core, request, direction, data, length, timeoutMs);
     }
     return deviceControl(core.device.get(), request, direction, data, length, timeoutMs);
@@ -833,7 +833,7 @@ public struct Endpoint {
     /// A buffer for this endpoint: usbfs-mapped (zero-copy) memory on Linux when the kernel allows, heap memory
     /// otherwise.
     public fn allocate(borrow this, capacity: usize) -> Result<Buffer, UsbError> {
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             if (capacity > 0) {
                 match (Buffer.mapUsbfs(this.fd, capacity)) {
                     Some(b) => {
@@ -894,13 +894,13 @@ public struct Endpoint {
         if (this.fake) {
             return Ok();
         }
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             linuxSubmit(this.fd, slot, this.addr, this.kind is TransferType.Interrupt, pointer, length);
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macSubmit(this.iface.get().mac, this.pipe, isIn, slot, pointer, length);
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             winSubmit(this.iface.get(), this.addr, slot, pointer, length);
         }
         return Ok();
@@ -991,11 +991,11 @@ public struct Endpoint {
             }
             return;
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             macAbort(this.iface.get().mac, this.pipe);
             return;
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             winAbort(this.iface.get(), this.addr);
             return;
         }
@@ -1006,7 +1006,7 @@ public struct Endpoint {
             let index = (this.head + k) % size;
             let slot = borrow mut this.ring.slots[index] as *mut Slot;
             if (unsafe { Ptr.toBorrow(slot as *Slot).state.load() } == SLOT_PENDING) {
-                if (cfg("USB_OS_LINUX")) {
+                if (cfg("target.linux")) {
                     linuxDiscard(this.fd, slot);
                 }
             }
@@ -1019,13 +1019,13 @@ public struct Endpoint {
 
     /// Clears a halt (stall) on the endpoint and resets its data toggle.
     public fn clearHalt(borrow this) -> Result<void, UsbError> {
-        if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.linux")) {
             return linuxClearHalt(this.fd, this.addr);
         }
-        if (cfg("USB_OS_MACOS")) {
+        if (cfg("target.macos")) {
             return macClearHalt(this.iface.get().mac, this.pipe);
         }
-        if (cfg("USB_OS_WINDOWS")) {
+        if (cfg("target.windows")) {
             return winClearHalt(this.iface.get(), this.addr);
         }
         return Err(UsbError.create(ErrorKind.Unsupported, Operation.ClearHalt, 0));

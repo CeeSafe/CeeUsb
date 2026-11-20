@@ -22,9 +22,8 @@
 
 ## Linking
 
-IOKit and CoreFoundation are frameworks, which a CeeSafe manifest cannot name; `src/platform/native.c` carries
-Mach-O autolink options (`.linker_option "-framework", "IOKit"`), so programs that use the package link them with
-no flags.
+IOKit and CoreFoundation are linked by the manifest (`frameworks` in `[target.macos]`), so programs that use the
+package link them with no flags.
 
 ## Notes
 

@@ -11,35 +11,37 @@
 // - Deregistering a descriptor from the loop needs no lock on the hot path: an epoch counter, bumped by the loop
 //   before each epoll_wait, tells the closer when no stale event for it can still be in hand.
 
-@header("usb_os.h")
 extern "C" {
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     @effects()
     fn epoll_create1(flags: i32) -> i32;
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     @effects()
     fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut u8) -> i32;
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     fn epoll_wait(epfd: i32, events: *mut u8, maxEvents: i32, timeout: i32) -> i32;
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     @effects()
     fn eventfd(initial: u32, flags: i32) -> i32;
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     @effects()
     fn write(fd: i32, data: *u8, count: usize) -> isize;
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     @effects()
     fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     @effects()
     fn bind(fd: i32, address: *u8, length: u32) -> i32;
-    @cfg("USB_OS_LINUX")
+    @cfg("target.linux")
     @effects()
     fn recvfrom(fd: i32, buffer: *mut u8, length: usize, flags: i32, source: *mut u8, sourceLength: *mut u32) -> isize;
-    @cfg("USB_OS_LINUX")
+    /// `ioctl` for the requests that return at once (SUBMITURB, DISCARDURB, REAPURBNDELAY): the same C function,
+    /// declared again with no effects so async code may submit and cancel (ADR 0181).
+    @cfg("target.linux")
+    @cname("ioctl")
     @effects()
-    fn usb_ioctl_prompt(fd: i32, request: CULong, argument: *mut void) -> i32;
-    @cfg("USB_OS_LINUX")
+    fn ioctlPrompt(fd: i32, request: CULong, ...) -> i32;
+    @cfg("target.linux")
     @effects()
     fn readlink(path: *CChar, buffer: *mut u8, size: usize) -> isize;
 }
@@ -177,8 +179,8 @@ static WAKE_TARGET: AtomicU64 = AtomicU64.constant(0);
 /// Starts the epoll thread once per process; the epoll descriptor, or the error.
 /// Safety: plain syscalls; the wake target is leaked on purpose (it lives as long as the loop, the process).
 fn ensureLoop() -> Result<i32, UsbError> {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             loop {
                 match (LOOP_STATE.compareExchange(0, 1)) {
                     Ok(_) => {
@@ -209,9 +211,10 @@ fn ensureLoop() -> Result<i32, UsbError> {
                             LOOP_STATE.store(3);
                             return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, lastError()));
                         }
-                        if (!startThread(loopMain, loopMainWindows)) {
+                        // The loop runs for the process; nothing joins it (ADR 0182).
+                        if (Thread.service("usb-epoll", move () => { loopMain(); }).isErr()) {
                             LOOP_STATE.store(3);
-                            return Err(UsbError.create(ErrorKind.Other, Operation.EventLoop, lastError()));
+                            return Err(UsbError.noMemory(Operation.EventLoop));
                         }
                         LOOP_STATE.store(2);
                         return Ok(ep);
@@ -234,26 +237,18 @@ fn ensureLoop() -> Result<i32, UsbError> {
 
 /// The epoll_event layout differs: packed (12 bytes, data at 4) on x86-64, natural (16, data at 8) elsewhere.
 fn eventSize() -> usize {
-    var size: usize = 16;
-    if (cfg("USB_EPOLL_PACKED")) {
-        size = 12;
-    }
-    return size;
+    return if (Target.isX86_64()) 12 else 16;
 }
 
 fn eventDataOffset() -> usize {
-    var at: usize = 8;
-    if (cfg("USB_EPOLL_PACKED")) {
-        at = 4;
-    }
-    return at;
+    return if (Target.isX86_64()) 4 else 8;
 }
 
 /// Registers `fd` with the loop, its events pointing at `target`.
 /// Safety: `target` outlives the registration.
 fn addFd(ep: i32, fd: i32, events: u32, target: *EventTarget) -> bool {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             var e = [0u8; 16];
             e[..].writeLE(0, events);
             e[..].writeLE(eventDataOffset(), target as usize as u64);
@@ -277,8 +272,8 @@ fn register(target: borrow EventTarget, events: u32, operation: Operation) -> Re
 /// (waking the loop so it does) is enough. Then the owner may close the descriptor and free the target.
 /// Safety: plain syscalls; the eventfd write wakes the loop.
 fn unregister(target: borrow EventTarget) {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             if (LOOP_STATE.load() != 2) {
                 return;
             }
@@ -302,13 +297,12 @@ fn unregister(target: borrow EventTarget) {
     }
 }
 
-/// The loop thread's body (pthread's signature).
+/// The loop thread's body: a service thread for the process (ADR 0182).
 /// Safety: every target pointer in epoll was registered by `register` and is alive until `unregister` returns,
 /// which waits for this loop to pass the epoch it was removed in.
-@callback
-fn loopMain(argument: *mut void) -> *mut void {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+fn loopMain() {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             let ep = truncate<i32>(EPOLL_FD.load());
             let size = eventSize();
             let at = eventDataOffset();
@@ -327,7 +321,7 @@ fn loopMain(argument: *mut void) -> *mut void {
                         truncate<u64>(lastError()),
                     );
                     LOOP_STATE.store(3);
-                    break;
+                    return;
                 }
                 for (i in 0..(truncate<usize>(n))) {
                     let data = events[..].readLE<u64>(i * size + at);
@@ -344,22 +338,17 @@ fn loopMain(argument: *mut void) -> *mut void {
             }
         }
     }
-    return 0 as *mut void;
 }
-
-/// Windows's thread signature; never started on Linux, but `startThread` takes both.
-@callback
-fn loopMainWindows(argument: *mut void) -> u32 => 0;
 
 /// Reaps every finished URB of one device and completes its slot.
 /// Safety: a reaped URB pointer is the address of a ring Slot submitted on this descriptor (see transfer.cee);
 /// its ring is alive while it counts the URB in `outstanding`.
 fn reapAll(target: borrow EventTarget, ep: i32) {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             loop {
                 var urb: *mut void = 0 as *mut void;
-                let r = unsafe { usb_ioctl_prompt(
+                let r = unsafe { ioctlPrompt(
                     target.fd,
                     USBDEVFS_REAPURBNDELAY as CULong,
                     borrow mut urb as *mut *mut void as *mut void,
@@ -423,8 +412,8 @@ struct LinuxOpened {
 /// Opens /dev/bus/usb/BBB/DDD, reads its descriptors and registers it with the loop.
 /// Safety: plain syscalls on a descriptor this function owns until it returns it.
 fn linuxOpen(bus: u8, address: u8) -> Result<LinuxOpened, UsbError> {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             var path = [0u8; 32];
             var w = TextWriter.create(mut path[..]);
             w.text("/dev/bus/usb/");
@@ -502,7 +491,7 @@ fn pad3<region r>(w: borrow mut TextWriter<r>, n: u8) {
 /// Closes a device: out of the loop first, then the descriptor (which releases its interfaces).
 /// Safety: the loop no longer uses the target once `unregister` returns.
 fn linuxClose(fd: i32, target: borrow EventTarget) {
-    if (cfg("USB_OS_POSIX")) {
+    if (cfg("target.unix")) {
         unregister(target);
         unsafe { close(fd); }
     }
@@ -511,7 +500,7 @@ fn linuxClose(fd: i32, target: borrow EventTarget) {
 /// Runs a usbfs ioctl whose argument is a pointer, as a Result.
 /// Safety: callers pass a request with the matching argument struct.
 fn usbfs(fd: i32, request: u32, argument: *mut void, operation: Operation) -> Result<i32, UsbError> {
-    if (cfg("USB_OS_POSIX")) {
+    if (cfg("target.unix")) {
         let r = unsafe { ioctl(fd, request as CULong, argument) };
         if (r < 0) {
             return Err(errnoError(operation));
@@ -632,7 +621,7 @@ fn linuxControl(
 /// Safety: `slot` is a FREE slot of a live ring, now owned by the OS until reaped; `buffer` stays alive and
 /// unmoved until then (the endpoint keeps it).
 fn linuxSubmit(fd: i32, slot: *mut Slot, endpoint: u8, interrupt: bool, buffer: *mut u8, length: usize) {
-    if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.linux")) {
         let u = unsafe { Ptr.toBorrowMut(slot as *mut Urb) };
         u.kind = if (interrupt) URB_TYPE_INTERRUPT else URB_TYPE_BULK;
         u.endpoint = endpoint;
@@ -646,7 +635,7 @@ fn linuxSubmit(fd: i32, slot: *mut Slot, endpoint: u8, interrupt: bool, buffer: 
         u.errorCount = 0;
         u.signr = 0;
         u.userContext = slot as *mut void;
-        if (unsafe { usb_ioctl_prompt(fd, USBDEVFS_SUBMITURB as CULong, slot as *mut void) } < 0) {
+        if (unsafe { ioctlPrompt(fd, USBDEVFS_SUBMITURB as CULong, slot as *mut void) } < 0) {
             let errno = lastError();
             let status = statusFromErrno(errno);
             traceNumber(TraceLevel.Warn, "SUBMITURB failed, errno", truncate<u64>(errno));
@@ -660,8 +649,8 @@ fn linuxSubmit(fd: i32, slot: *mut Slot, endpoint: u8, interrupt: bool, buffer: 
 /// Asks usbfs to give a pending URB back early (as Cancelled). Harmless if it already finished.
 /// Safety: the slot is not reused before it is taken, so its address names this URB or none.
 fn linuxDiscard(fd: i32, slot: *mut Slot) {
-    if (cfg("USB_OS_LINUX")) {
-        unsafe { usb_ioctl_prompt(fd, USBDEVFS_DISCARDURB as CULong, slot as *mut void); }
+    if (cfg("target.linux")) {
+        unsafe { ioctlPrompt(fd, USBDEVFS_DISCARDURB as CULong, slot as *mut void); }
     }
 }
 
@@ -974,8 +963,8 @@ fn listBusesInner(out: borrow mut Vector<BusInfo>) -> Result<void, AllocError> {
         busId.append(StringView.fromUtf8(dw.written())!)?;
         // The controller is the root hub's parent; its driver is the `driver` link's last part.
         var driver: String? = null;
-        if (cfg("USB_OS_POSIX")) {
-            if (cfg("USB_OS_LINUX")) {
+        if (cfg("target.unix")) {
+            if (cfg("target.linux")) {
                 var link = [0u8; 300];
                 var lw = TextWriter.create(mut link[..]);
                 lw.text(path.view());
@@ -1015,8 +1004,8 @@ struct HotplugSink {
 /// Opens the udev netlink socket and registers it with the loop.
 /// Safety: plain syscalls; `sockaddr_nl` is 12 bytes: family u16, pad u16, pid u32, groups u32.
 fn linuxHotplugOpen(sink: *void) -> Result<Box<EventTarget>, UsbError> {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             let fd = unsafe { socket(AF_NETLINK, SOCK_RAW_CLOEXEC_NONBLOCK, NETLINK_KOBJECT_UEVENT) };
             if (fd < 0) {
                 return Err(errnoError(Operation.Hotplug));
@@ -1053,7 +1042,7 @@ fn linuxHotplugOpen(sink: *void) -> Result<Box<EventTarget>, UsbError> {
 
 /// Safety: the loop no longer uses the target once `unregister` returns, so the descriptor may close.
 fn linuxHotplugClose(target: borrow EventTarget) {
-    if (cfg("USB_OS_POSIX")) {
+    if (cfg("target.unix")) {
         unregister(target);
         unsafe { close(target.fd); }
     }
@@ -1062,8 +1051,8 @@ fn linuxHotplugClose(target: borrow EventTarget) {
 /// Reads every queued uevent and forwards the USB device ones.
 /// Safety: the sink is alive while the target is registered.
 fn drainHotplug(target: borrow EventTarget) {
-    if (cfg("USB_OS_POSIX")) {
-        if (cfg("USB_OS_LINUX")) {
+    if (cfg("target.unix")) {
+        if (cfg("target.linux")) {
             let sink = unsafe { Ptr.toBorrow(target.sink as *HotplugSink) };
             var message = [0u8; 8192];
             loop {

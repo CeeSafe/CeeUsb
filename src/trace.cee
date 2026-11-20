@@ -2,7 +2,6 @@
 // CEEUSB_TRACE=error|warn|debug in the environment sets the level at the first trace; Trace.setLevel overrides it.
 // Lines are built on the stack (no allocation) and never carry transfer data.
 
-@header("usb_os.h")
 extern "C" {
     @effects()
     fn usb_trace_env_level() -> i32;

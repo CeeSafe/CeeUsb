@@ -11,8 +11,8 @@ CeeSafe's ownership model to remove the C# version's per-transfer costs.
 | macOS | IOKit IOUSBLib (COM vtables, called from CeeSafe) | IORegistry | one CFRunLoop thread | IOKit notifications |
 | Windows | WinUSB | cfgmgr32 + hub IOCTLs | one I/O completion port thread | CM_Register_Notification |
 
-No libusb, no C library beyond the OS's own. The C in the package is `src/platform/native.c`: `errno`, macOS
-framework autolinking, one data symbol, and three one-call trampolines (see `CEESAFE_FINDINGS.md` F2, F6, F7).
+No libusb, no C library beyond the OS's own. The C in the package is `src/platform/native.c`: `errno` (a C macro)
+and two tracing helpers. Needs ceesafec 0.79.0 or later.
 
 ## Quick start
 
@@ -126,6 +126,8 @@ one failure never stops a stream; after a `Stall`, call `endpoint.clearHalt()`.
 | macOS: one-transfer 2-byte bulk OUT `write` (full-speed printer), mean of 2000, 2 runs | **223 µs** | 403–624 µs |
 | Ring overhead per transfer (no OS call, cross-thread) | 165 ns | — |
 
+The ring figure is printed by the `streamThroughTheRing` test: `ceesafec test --filter streamThroughTheRing --show-output`.
+
 Streaming on Linux against Gadget Zero (`g_zero`) on the `dummy_hcd` virtual controller, 5 s per run. Both sides
 reach the controller's own ceiling, so the measure is the CPU each spends to get there (`/usr/bin/time`, user + sys;
 the C# figures include ~0.1-0.2 s of runtime start-up):
@@ -187,7 +189,7 @@ hardware was available.
 src/            errors, types, descriptors (zero-copy), info, buffer, transfer (the ring), device (the API),
                 stream (Reader/Writer), hotplug (Watcher), sys (POSIX/Win32 basics)
 src/platform/   linux.cee, macos.cee, windows.cee, native.c
-include/        usb_os.h: the OS macros cfg() names (CEESAFE_FINDINGS F3)
+include/        usb_cf.h: kCFRunLoopDefaultMode declared alone (CEESAFE_FINDINGS F11)
 tests/          descriptor, ring and stream tests
 docs/           architecture, transfers, error handling and diagnostics, linux, macos, windows, API mapping from C#
 examples/       list (lsusb), info (open a device and read it), watch (hotplug), interrupt (interrupt reports),

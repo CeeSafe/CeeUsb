@@ -6,16 +6,15 @@ Public API      Usb · Device · Interface · Endpoint · Buffer · Completion �
                      │
 Cores           DeviceCore ◄─Arc── InterfaceCore ◄─Arc── Endpoint (owns its Ring)
                      │                                       │
-                     │ compile-time dispatch: if (cfg("USB_OS_…"))
+                     │ compile-time dispatch: if (cfg("target.…"))
      ┌───────────────┼──────────────────────┐                │ completions
  platform/linux   platform/macos     platform/windows        ▼
  usbfs ioctls     IOUSBLib vtables   WinUSB + cfgmgr32   one event-loop thread per process:
  sysfs, netlink   IORegistry          hub IOCTLs          epoll · CFRunLoop · I/O completion port
 ```
 
-There is no backend interface and no virtual call: `include/usb_os.h` defines `USB_OS_LINUX`, `USB_OS_MACOS`,
-`USB_OS_WINDOWS` and `USB_OS_POSIX`, and each operation branches on them with `if (cfg(…))`, which compiles to C's
-`#if`. Every branch is type-checked on every build (CeeSafe requires it), so a change that breaks another
+There is no backend interface and no virtual call: each operation branches on CeeSafe's target conditions,
+`if (cfg("target.linux"))`, `"target.macos"`, `"target.windows"` and `"target.unix"`, which compile to C's `#if`. Every branch is type-checked on every build (CeeSafe requires it), so a change that breaks another
 platform's code fails the check on the machine where it is made.
 
 ## Ownership
@@ -42,8 +41,12 @@ publishes a result; an `AsyncSignal` wakes the owner. No lock and no allocation 
 
 ## Event loops
 
-One thread per process per platform, started on first use with `pthread_create` / `CreateThread` and detached
-(a CeeSafe `Thread` is joined at exit; see CEESAFE_FINDINGS F4). Nothing the user owns is ever dropped on it.
+One thread per process per platform, started on first use with `Thread.service` (named `usb-epoll`, `usb-runloop`
+or `usb-iocp`), which runs for the process and is never joined. Nothing the user owns is ever dropped on it.
+
+On Linux the loop stays a thread rather than tasks waiting with `AsyncFd`: the blocking API (`read`, `flush` with a
+timeout) waits on the same rings, and a task that reaped through `AsyncFd` while the loop also reaps could park on
+an edge the loop had already consumed.
 
 | | Wakes on | Per wakeup | Deregistration |
 |---|---|---|---|
@@ -63,7 +66,7 @@ Synchronous everywhere: `USBDEVFS_CONTROL` (the kernel enforces the timeout), IO
 
 ## What is C
 
-`src/platform/native.c`: `errno`; the Mach-O autolink options for IOKit and CoreFoundation; the address of
-`kCFRunLoopDefaultMode`; three one-call trampolines that let async code submit and cancel (`ioctl` for the
-non-blocking usbfs requests, IOKit's `ReadPipeAsync`/`WritePipeAsync`/`AbortPipe` through the vtable); the trace
-level from the environment and the stderr write. Each exists because of a gap logged in `CEESAFE_FINDINGS.md`.
+`src/platform/native.c`: `errno`, which is a C macro; the trace level from the environment and the stderr write.
+Everything else is CeeSafe: the non-blocking usbfs ioctls through `ioctlPrompt`, a second declaration of `ioctl`
+with no effects; IOKit's `ReadPipeAsync`, `WritePipeAsync` and `AbortPipe` through vtable slots typed
+`@effects() extern "C" fn`; `kCFRunLoopDefaultMode` as a configured C static (`include/usb_cf.h` declares it).

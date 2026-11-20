@@ -102,7 +102,7 @@ fn main() {
     };
     // Start from a reset device (the firmware's bulk endpoints do not survive a previous session). Windows has no
     // reset; macOS invalidates the device across one, so it is found again.
-    if (cfg("!USB_OS_WINDOWS")) {
+    if (cfg("!target.windows")) {
         match (usb.Usb.open(borrow info)) {
             Ok(pre) => {
                 let _ = pre.reset();
@@ -122,7 +122,7 @@ fn main() {
         }
     }
     let device = usb.Usb.open(borrow info)!;
-    if (cfg("USB_OS_MACOS")) {
+    if (cfg("target.macos")) {
         // macOS hands over a vendor-class interface only once the configuration is set explicitly.
         let _ = device.setConfiguration(1);
     }

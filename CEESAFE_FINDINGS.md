@@ -6,16 +6,18 @@ otherwise; Linux checks on Ubuntu 24.04 x86-64 (gcc), Windows checks on Windows 
 
 | | What | Kind | State |
 |---|---|---|---|
-| F1 | a `Slice<r, T>` field passed to a call inside a returned struct literal is taken as a loan of `this` (N0245) | bug | open; worked around |
-| F2 | a manifest cannot link a macOS framework | gap | open; worked around |
-| F3 | `cfg()` cannot name the compiler's OS macros, and there is no target-OS condition of CeeSafe's own | gap | open; worked around |
-| F4 | no detached thread: a dropped `Thread<T>` is joined, so a process-lifetime event loop cannot be a CeeSafe thread | gap | open; worked around |
-| F5 | async code cannot wait for readiness of a descriptor it owns (the runtime's `ceesafe_async_wait_readable` is private) | gap | open; worked around |
-| F6 | `@cfg` is refused on a C static (`static kCFRunLoopDefaultMode: *void;`), so per-OS C data cannot be named | gap | open; worked around |
-| F7 | a call through a C function pointer always counts as `sleep` + `alloc`, with no way to declare it prompt | gap | open; worked around |
-| F8 | constants of struct type are not supported (N0216), even for `@repr(C)` structs of integers | gap | open; worked around |
-| F9 | the generated C draws compiler warnings: unused labels, `-Wreturn-type`, `-Wmaybe-uninitialized` | build noise | open |
-| F10 | `ceesafec test` shows a passing test's output only with `--format json` | papercut | open |
+| F1 | a `Slice<r, T>` field passed to a call inside a returned struct literal is taken as a loan of `this` (N0245) | bug | fixed in ceesafec 0.79.0; workaround removed |
+| F2 | a manifest cannot link a macOS framework | gap | fixed in 0.79.0 (`frameworks`, ADR 0184); workaround removed |
+| F3 | `cfg()` cannot name the compiler's OS macros, and there is no target-OS condition of CeeSafe's own | gap | fixed in 0.79.0 (target conditions, ADR 0179); `usb_os.h` removed |
+| F4 | no detached thread: a dropped `Thread<T>` is joined, so a process-lifetime event loop cannot be a CeeSafe thread | gap | fixed in 0.79.0 (`Thread.service`, ADR 0182); the three loops use it |
+| F5 | async code cannot wait for readiness of a descriptor it owns (the runtime's `ceesafe_async_wait_readable` is private) | gap | fixed in 0.79.0 (`AsyncFd`, ADR 0183); not adopted: the blocking API shares the rings (docs/architecture.md) |
+| F6 | `@cfg` is refused on a C static (`static kCFRunLoopDefaultMode: *void;`), so per-OS C data cannot be named | gap | fixed in 0.79.0 (configured statics, ADR 0179); used, with F11 |
+| F7 | a call through a C function pointer always counts as `sleep` + `alloc`, with no way to declare it prompt | gap | fixed in 0.79.0 (ADR 0181); trampolines removed |
+| F8 | constants of struct type are not supported (N0216), even for `@repr(C)` structs of integers | gap | fixed in 0.79.0 (ADR 0180); GUIDs and keys are constants |
+| F9 | the generated C draws compiler warnings: unused labels, `-Wreturn-type`, `-Wmaybe-uninitialized` | build noise | fixed in 0.79.0 |
+| F10 | `ceesafec test` shows a passing test's output only with `--format json` | papercut | fixed in 0.79.0 (`--show-output`, ADR 0185); the README says to use it |
+| F11 | an imported C static needs a header that declares it, and a system header also declares the functions this package declares with other pointer types, which C then rejects | gap | open; worked around |
+| F12 | ceesafec 0.78.1's Windows runtime warns in every build (`-Wsign-conversion`, `ceesafe_rt_io.c:375`) | build noise | open |
 
 ## F1. A slice field passed to a call inside a returned struct literal is taken as a loan of `this`
 
@@ -156,3 +158,26 @@ user did not write:
 **Kind:** papercut (`ceesafec test`). A test that measures something (`streamThroughTheRing` prints the ring's cost
 per transfer) shows its output only through `--format json`; the text report shows output for failures only. A
 `--show-output` (as `cargo test -- --nocapture`) would do.
+
+## F11. An imported static's header conflicts with the package's own declarations
+
+**Kind:** gap (C interop, type-system.md §39.4). An imported static is "data its headers define": CeeSafe emits no
+declaration of it, so its block needs a `@header` that declares `kCFRunLoopDefaultMode`. The header that does,
+`<CoreFoundation/CoreFoundation.h>`, also declares `CFRunLoopAddSource` and the other CF functions with CF types
+(`CFRunLoopRef`, `CFStringRef`), and the package declares them with `*void`: the generated C's prototypes conflict
+with the header's (`conflicting types for 'CFRunLoopAddSource'`, a dozen of them). Found with ceesafec 0.79.0.
+
+**Here:** `include/usb_cf.h`, one line, `extern const void *const kCFRunLoopDefaultMode;`, as the configured block's
+header.
+
+**Wanted:** a C static whose declaration CeeSafe emits itself when no header declares it (as it does for functions),
+or a way to name CF's pointer typedefs so the package's declarations can match the header's.
+
+## F12. A warning from the runtime in every Windows build
+
+**Kind:** build noise (ceesafec 0.78.1 and 0.79.0, MinGW gcc 16.2). `ceesafe_rt_io.c:375`, added in 0.78.1 for
+read-only files: `attributes & ~FILE_ATTRIBUTE_READONLY` complements an `int` and converts -2 to `DWORD`, which
+`-Wsign-conversion` reports. `~(DWORD)FILE_ATTRIBUTE_READONLY` is the fix.
+
+**Here:** nothing to do in the package; the warning is printed and the build succeeds.
+
